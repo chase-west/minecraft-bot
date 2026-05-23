@@ -1,0 +1,24 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+.claude/
+.vscode/
+.idea/
+
+# rollout data (large, runtime-generated)
+data/online/
+
+# trained model artefacts (rebuild with training/train_dqn.py)
+models/*.onnx
+*.onnx.bak
+
+# python
+training/data/
+training/checkpoints/
+training/__pycache__/
+*.pyc
+
+.DS_Store
+Thumbs.db

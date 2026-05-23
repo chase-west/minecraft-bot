@@ -1,0 +1,32 @@
+{
+  "name": "minecraft-bedrock-ai",
+  "version": "0.1.0",
+  "description": "Hybrid AI agent for Minecraft Bedrock Edition: LLM planner + GOAP + ML policies",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node --env-file=.env --enable-source-maps dist/index.js",
+    "dev": "node --env-file=.env --max-old-space-size=8192 --import tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --import tsx dist/**/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "bedrock-protocol": "^3.56.1",
+    "onnxruntime-node": "^1.20.0",
+    "prismarine-auth": "^2.4.1",
+    "prismarine-chunk": "^1.40.0",
+    "prismarine-nbt": "^2.5.0",
+    "prismarine-registry": "^1.12.0",
+    "vec3": "^0.1.10"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
