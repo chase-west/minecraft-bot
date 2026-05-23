@@ -34,6 +34,10 @@ interface PolicySession {
   outputName: string;
   inputBuffer: Float32Array;
   inputTensor: ort.Tensor;
+  // Number of in-flight act() calls that captured this session as their local
+  // ref. watchForReload() must NOT call session.release() while this is >0 or
+  // the native ONNX handle gets freed mid-inference (possible crash/segfault).
+  inflight: number;
 }
 
 /**
@@ -92,7 +96,7 @@ export class LearnedPolicy {
       const outputName = outputs.includes("logits") ? "logits" : (outputs[0] ?? "logits");
       const inputBuffer = new Float32Array(OBS_DIM);
       const inputTensor = new ort.Tensor("float32", inputBuffer, [1, OBS_DIM]);
-      return { session, inputName, outputName, inputBuffer, inputTensor };
+      return { session, inputName, outputName, inputBuffer, inputTensor, inflight: 0 };
     } catch (err) {
       log.warn(`failed to load policy at ${p}: ${(err as Error).message}`);
       return null;
@@ -128,9 +132,20 @@ export class LearnedPolicy {
           this.lastMtimeMs = stat.mtimeMs;
           this.reloadCount++;
           log.info(`policy hot-reloaded (#${this.reloadCount}) from ${this.resolvedPath}`);
-          // Release the old session asynchronously; any in-flight act() call
-          // captured a local ref, so this is safe.
+          // Release the old session asynchronously, but only after any
+          // in-flight act() call using it has resolved. Releasing while
+          // session.run() is mid-await frees the native ONNX handle from
+          // under the running inference — possible crash/segfault. Poll the
+          // inflight counter every 50ms up to 2s, then release anyway as a
+          // safety valve so we don't leak sessions if a call wedges.
           if (prev) {
+            const deadline = Date.now() + 2000;
+            while (prev.inflight > 0 && Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 50));
+            }
+            if (prev.inflight > 0) {
+              log.warn(`releasing previous session with ${prev.inflight} act() call(s) still in flight after 2s`);
+            }
             try { await prev.session.release(); }
             catch (_) { /* old session already dead — ignore */ }
           }
@@ -145,6 +160,9 @@ export class LearnedPolicy {
         this.reloading = false;
       }
     }, intervalMs);
+    // Don't pin the event loop on the watcher — agent.stop() also calls
+    // stopWatching(), but this is belt-and-suspenders for clean shutdown.
+    this.watchHandle.unref?.();
   }
 
   stopWatching(): void {
@@ -174,14 +192,23 @@ export class LearnedPolicy {
 
     sess.inputBuffer.set(obs);
     const feeds: Record<string, ort.Tensor> = { [sess.inputName]: sess.inputTensor };
-    const out = await sess.session.run(feeds);
-    const result = out[sess.outputName];
-    if (!result) {
-      throw new Error(`policy returned no output for name ${sess.outputName}`);
-    }
-    const logits = result.data as Float32Array;
-    if (logits.length < ACTION_COUNT) {
-      throw new Error(`policy returned ${logits.length} logits, expected ${ACTION_COUNT}`);
+    // Mark this session in-flight so a concurrent hot-reload waits for us
+    // before calling session.release() — releasing the native ONNX handle
+    // while session.run() is mid-await can crash the process.
+    sess.inflight++;
+    let logits: Float32Array;
+    try {
+      const out = await sess.session.run(feeds);
+      const result = out[sess.outputName];
+      if (!result) {
+        throw new Error(`policy returned no output for name ${sess.outputName}`);
+      }
+      logits = result.data as Float32Array;
+      if (logits.length < ACTION_COUNT) {
+        throw new Error(`policy returned ${logits.length} logits, expected ${ACTION_COUNT}`);
+      }
+    } finally {
+      sess.inflight--;
     }
 
     const temperature = opts.temperature ?? 0;

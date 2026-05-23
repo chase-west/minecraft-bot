@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.log
+*.err
 .env
 .env.local
 .claude/

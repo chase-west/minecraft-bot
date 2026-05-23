@@ -39,7 +39,9 @@ export interface ActionContext {
 // Module-private state held across calls.
 const state = {
   lastSprint: false,
-  lastMoveYaw: 0 as number, // remembers facing for MoveForwardJump
+  // Bedrock yaw 180 = north (matches the "or N if none yet" comment on
+  // MoveForwardJump). Previously 0 = south, which contradicted that contract.
+  lastMoveYaw: 180 as number, // remembers facing for MoveForwardJump
 };
 
 // Bedrock yaw convention: 0 = south (+Z), 90 = west (-X), 180 = north (-Z),

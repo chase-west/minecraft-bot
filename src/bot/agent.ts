@@ -1,6 +1,6 @@
 import type { BedrockClient } from "../connection/client.js";
 import { World } from "../world/world.js";
-import { attachPerception } from "../world/perception.js";
+import { attachPerception, detachPerception } from "../world/perception.js";
 import { attachChunkStream, ChunkCache } from "../world/chunk.js";
 import { InputController } from "../actions/input.js";
 import { ALL_ACTIONS } from "../goap/actions/index.js";
@@ -62,6 +62,11 @@ export class Agent {
   private learnedActive = false;
   private exploreActive = false;
   private actInFlight = false;
+  // Set by the bot_died event listener (perception emits this when health
+  // crosses to ≤0). The next trajectory log call consumes the flag and writes
+  // done=true so the DQN trainer treats that transition as terminal instead of
+  // bootstrap-blending the -50 death reward through gamma*Q(next).
+  private markTerminal = false;
 
   constructor(private readonly client: BedrockClient) {
     this.input = new InputController(client, this.world);
@@ -75,6 +80,12 @@ export class Agent {
     attachContainerEvents(this.client);
     attachCraftResponses(this.client);
     this.recipes.attach(this.client);
+    // Perception emits "bot_died" when health crosses to ≤0. Latch a flag so
+    // the next trajectory log marks the transition terminal — critical for
+    // DQN learning to attribute the -50 death reward without bootstrap-bleed.
+    (this.client as any).on?.("bot_died", () => {
+      this.markTerminal = true;
+    });
   }
 
   /** Called once the spawn packet has been received. Safe to start sending
@@ -137,46 +148,55 @@ export class Agent {
         }
 
         const now = Date.now();
-        const useLearned = this.learnedActive && !this.actInFlight;
+        // Sticky re-execution only needs a policy to repeat; it does NOT need
+        // !actInFlight (an in-flight policy.act has already settled stickyAction
+        // for the current decision). Keeping these decoupled means a slow
+        // inference doesn't blackhole the tick — sticky keeps firing at 10Hz.
         const inStickyWindow = now < this.stickyUntil;
+        const useLearned = this.learnedActive && !this.actInFlight;
         const epsilonRoll = isOnline && useLearned && !inStickyWindow && Math.random() < this.onlineEpsilon;
 
-        if (useLearned && inStickyWindow) {
-          // Still holding the previous policy action — re-execute and log it
-          // so the input ticker keeps the movement bit set, but skip inference.
-          this.trajLogger!.log(obs, this.stickyAction, r);
+        if (this.learnedActive && inStickyWindow) {
+          // Still inside the sticky window of the most recent policy decision.
+          // Re-fire executeAction so the input ticker holds the movement bit,
+          // but do NOT log a new trajectory row: the (obs, action) pair was
+          // already canonical at dispatch time. Logging a fresh obs paired with
+          // the stale action would teach the DQN Q(s_{t+k}, a_t), which is wrong.
           executeAction(this.stickyAction, ctx).catch((err) => {
             if (this.shadowSamples < 5) log.warn(`sticky action ${this.stickyAction} failed: ${(err as Error).message}`);
           });
         } else if (useLearned && !epsilonRoll) {
           // Fire-and-forget inference. Snapshot obs before handing off.
           const obsCopy = new Float32Array(obs);
+          const terminal = this.markTerminal; this.markTerminal = false;
           this.actInFlight = true;
           this.policy.act(obsCopy)
             .then(async (actionId) => {
               this.stickyAction = actionId;
               this.stickyUntil = Date.now() + this.policyStickyMs;
-              this.trajLogger?.log(obsCopy, actionId, r);
+              this.trajLogger?.log(obsCopy, actionId, r, terminal);
               try { await executeAction(actionId, ctx); }
               catch (err) { log.warn(`executeAction(${actionId}) failed: ${(err as Error).message}`); }
             })
             .catch((err) => {
               log.warn(`policy.act failed: ${(err as Error).message}`);
-              this.trajLogger?.log(obsCopy, ActionId.Noop, r);
+              this.trajLogger?.log(obsCopy, ActionId.Noop, r, terminal);
             })
             .finally(() => { this.actInFlight = false; });
         } else if (this.exploreActive || epsilonRoll) {
           // Sticky random-walk — pure explore mode, or ε-greedy fresh-data
           // sampling inside online mode.
           const actionId = this.explorer.nextAction();
-          this.trajLogger!.log(obs, actionId, r);
+          const terminal = this.markTerminal; this.markTerminal = false;
+          this.trajLogger!.log(obs, actionId, r, terminal);
           executeAction(actionId, ctx).catch((err) => {
             if (this.shadowSamples < 5) log.warn(`explore action ${actionId} failed: ${(err as Error).message}`);
           });
         } else if (!this.learnedActive) {
           // Shadow path: GOAP drives the bot from run(); we only log intent.
           const intent = readIntent();
-          this.trajLogger!.log(obs, intent, r);
+          const terminal = this.markTerminal; this.markTerminal = false;
+          this.trajLogger!.log(obs, intent, r, terminal);
         }
 
         this.shadowSamples++;
@@ -271,6 +291,8 @@ export class Agent {
     this.input.stop();
     if (this.shadowHandle !== null) { clearInterval(this.shadowHandle); this.shadowHandle = null; }
     if (this.trajLogger) { this.trajLogger.close(); this.trajLogger = null; }
+    this.policy.stopWatching();
+    detachPerception(this.client);
     this.blockIdRegistry.save();
   }
 }

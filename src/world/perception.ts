@@ -29,6 +29,32 @@ const HOSTILE_TYPES = new Set([
 
 const tickNowMs = () => Date.now();
 
+// Tracks per-client teardown hooks so Agent.stop() can cancel the pending
+// death-disconnect timer (and similar) instead of letting it fire after the
+// agent has already torn down.
+const teardownHooks = new WeakMap<BedrockClient, Set<() => void>>();
+
+function registerTeardown(client: BedrockClient, fn: () => void): void {
+  let set = teardownHooks.get(client);
+  if (!set) { set = new Set(); teardownHooks.set(client, set); }
+  set.add(fn);
+}
+
+/** Called by Agent.stop() to cancel any timers/intervals owned by perception. */
+export function detachPerception(client: BedrockClient): void {
+  const set = teardownHooks.get(client);
+  if (!set) return;
+  for (const fn of set) {
+    try { fn(); } catch { /* swallow — teardown is best-effort */ }
+  }
+  set.clear();
+  teardownHooks.delete(client);
+}
+
+// Health-attribute NaN warnings are logged once per session to avoid spam
+// when BDS sends sparse / partial attribute snapshots.
+let warnedHealthNaN = false;
+
 export function attachPerception(client: BedrockClient, world: World): void {
   client.on("start_game", (pkt: any) => {
     // Field names vary between bedrock-protocol versions: entity_id, runtime_entity_id, etc.
@@ -85,7 +111,10 @@ export function attachPerception(client: BedrockClient, world: World): void {
     const isUs = world.self.runtimeEntityId !== null && targetId === world.self.runtimeEntityId;
     const noIdYet = world.self.runtimeEntityId === null;
     if (!isUs && !noIdYet) return;
-    if (pkt.position && typeof pkt.position.x === "number") world.self.position = pkt.position;
+    if (pkt.position && typeof pkt.position.x === "number") {
+      // Clone — bedrock-protocol may mutate the packet object after dispatch.
+      world.self.position = { x: pkt.position.x, y: pkt.position.y, z: pkt.position.z };
+    }
     if (pkt.rotation) {
       world.self.pitch = pkt.rotation.x ?? world.self.pitch;
       world.self.yaw = pkt.rotation.z ?? world.self.yaw;
@@ -107,7 +136,9 @@ export function attachPerception(client: BedrockClient, world: World): void {
     if (correctMovePredictionCount <= 5 || correctMovePredictionCount % 20 === 0) {
       log.warn(`correct_player_move_prediction #${correctMovePredictionCount}: server forcing pos=${JSON.stringify(pkt.position)}`);
     }
-    if (pkt.position && typeof pkt.position.x === "number") world.self.position = pkt.position;
+    if (pkt.position && typeof pkt.position.x === "number") {
+      world.self.position = { x: pkt.position.x, y: pkt.position.y, z: pkt.position.z };
+    }
   });
 
   // Bedrock respawn handshake: server sends respawn(state=0=searching),
@@ -116,7 +147,9 @@ export function attachPerception(client: BedrockClient, world: World): void {
   // subsequent player_auth_input packet — bot looks frozen even though we're
   // sending movement commands at 20Hz.
   client.on("respawn", (pkt: any) => {
-    if (pkt.position) world.self.position = pkt.position;
+    if (pkt.position) {
+      world.self.position = { x: pkt.position.x, y: pkt.position.y, z: pkt.position.z };
+    }
     const state = pkt.state;
     log.info(`respawn: pos=${JSON.stringify(world.self.position)} state=${state}`);
     // state values: 0=server_searching, 1=server_ready, 2=client_ready, 3=client_spawn
@@ -155,8 +188,19 @@ export function attachPerception(client: BedrockClient, world: World): void {
   });
 
   // Health/food/etc come as attribute updates.
-  let lastHealth = 20;
+  // Sentinel -1: the first observation never trips the death detector. This
+  // prevents a reconnect-storm when BDS sends a stale update_attributes with
+  // health=0 before the respawn handshake completes.
+  let lastHealth = -1;
   let respawnPending = false;
+  let deathTimer: NodeJS.Timeout | null = null;
+  const cancelDeathTimer = () => {
+    if (deathTimer !== null) {
+      clearTimeout(deathTimer);
+      deathTimer = null;
+    }
+  };
+  registerTeardown(client, cancelDeathTimer);
   client.on("update_attributes", (pkt: any) => {
     if (world.self.runtimeEntityId === null) return;
     if (BigInt(pkt.runtime_entity_id ?? 0n) !== world.self.runtimeEntityId) return;
@@ -164,27 +208,46 @@ export function attachPerception(client: BedrockClient, world: World): void {
       const name = String(attr.name);
       const value = Number(attr.value ?? attr.current);
       if (name.endsWith(":health") || name === "health") {
+        if (!Number.isFinite(value)) {
+          if (!warnedHealthNaN) {
+            warnedHealthNaN = true;
+            log.warn(`health attribute missing/NaN (value=${attr.value} current=${attr.current}) — skipping (further warnings suppressed)`);
+          }
+          continue;
+        }
         world.self.health = value;
         if (typeof attr.max === "number") world.self.maxHealth = attr.max;
+        // A fresh respawn (state=1) arrives via the respawn handler; if a
+        // pending death timer is still scheduled, cancel it.
+        if (value > 0) cancelDeathTimer();
         if (lastHealth > 0 && value <= 0 && !respawnPending) {
           respawnPending = true;
           log.info("bot died — closing connection to force fresh reconnect (handles respawn cleanly)");
+          // Notify the agent so the next trajectory log row is flagged
+          // terminal (done=true). bedrock-protocol clients are EventEmitters,
+          // so a custom event keeps perception decoupled from agent internals.
+          try { (client as any).emit?.("bot_died"); }
+          catch (err) { log.warn(`bot_died emit failed: ${(err as Error).message}`); }
           // Give other death packets a moment, then disconnect. Index.ts's
           // session loop will reconnect with a fresh login flow.
-          setTimeout(() => {
+          cancelDeathTimer();
+          deathTimer = setTimeout(() => {
+            deathTimer = null;
             try { (client as any).close?.(); }
             catch (err) { log.warn(`close on death failed: ${(err as Error).message}`); }
           }, 500);
+          // Don't pin the event loop on this one timer.
+          deathTimer.unref?.();
         } else if (value > 0) {
           respawnPending = false;
         }
         lastHealth = value;
       } else if (name.endsWith(":player.hunger") || name === "player.hunger") {
-        world.self.food = value;
+        if (Number.isFinite(value)) world.self.food = value;
       } else if (name.endsWith(":player.saturation") || name === "player.saturation") {
-        world.self.saturation = value;
+        if (Number.isFinite(value)) world.self.saturation = value;
       } else if (name.endsWith(":player.level") || name === "player.level") {
-        world.self.experienceLevel = value;
+        if (Number.isFinite(value)) world.self.experienceLevel = value;
       }
     }
   });
@@ -197,8 +260,13 @@ export function attachPerception(client: BedrockClient, world: World): void {
       runtimeEntityId: id,
       uniqueId: pkt.unique_id !== undefined ? BigInt(pkt.unique_id) : undefined,
       type,
-      position: pkt.position ?? { x: 0, y: 0, z: 0 },
-      velocity: pkt.velocity ?? { x: 0, y: 0, z: 0 },
+      // Clone — bedrock-protocol may reuse/mutate the packet's vec3 objects.
+      position: pkt.position
+        ? { x: pkt.position.x, y: pkt.position.y, z: pkt.position.z }
+        : { x: 0, y: 0, z: 0 },
+      velocity: pkt.velocity
+        ? { x: pkt.velocity.x, y: pkt.velocity.y, z: pkt.velocity.z }
+        : { x: 0, y: 0, z: 0 },
       yaw: pkt.rotation?.z ?? 0,
       pitch: pkt.rotation?.x ?? 0,
       isHostile: HOSTILE_TYPES.has(type),
@@ -214,8 +282,12 @@ export function attachPerception(client: BedrockClient, world: World): void {
       runtimeEntityId: id,
       uniqueId: pkt.entity_unique_id !== undefined ? BigInt(pkt.entity_unique_id) : undefined,
       type: "minecraft:player",
-      position: pkt.position ?? { x: 0, y: 0, z: 0 },
-      velocity: pkt.velocity ?? { x: 0, y: 0, z: 0 },
+      position: pkt.position
+        ? { x: pkt.position.x, y: pkt.position.y, z: pkt.position.z }
+        : { x: 0, y: 0, z: 0 },
+      velocity: pkt.velocity
+        ? { x: pkt.velocity.x, y: pkt.velocity.y, z: pkt.velocity.z }
+        : { x: 0, y: 0, z: 0 },
       yaw: pkt.yaw ?? 0,
       pitch: pkt.pitch ?? 0,
       isPlayer: true,
@@ -227,15 +299,33 @@ export function attachPerception(client: BedrockClient, world: World): void {
   });
 
   client.on("remove_entity", (pkt: any) => {
-    if (pkt.entity_id_self !== undefined) world.removeEntity(BigInt(pkt.entity_id_self));
-    else if (pkt.unique_entity_id !== undefined) world.removeEntity(BigInt(pkt.unique_entity_id));
+    // proto.yml @ 1.26.10: packet_remove_entity carries only `entity_id_self`,
+    // which is the *unique* entity id (zigzag64). But world.entities is keyed
+    // by runtime id. Try the runtime-id fields first (some packet variants
+    // include them), then fall back to scanning by uniqueId.
+    const runtimeIdRaw = pkt.runtime_id ?? pkt.runtime_entity_id ?? pkt.target_runtime_id;
+    if (runtimeIdRaw !== undefined) {
+      world.removeEntity(BigInt(runtimeIdRaw));
+      return;
+    }
+    const uniqueRaw = pkt.entity_id_self ?? pkt.unique_entity_id ?? pkt.unique_id;
+    if (uniqueRaw === undefined) return;
+    const uniqueId = BigInt(uniqueRaw);
+    for (const [key, ent] of world.entities) {
+      if (ent.uniqueId !== undefined && ent.uniqueId === uniqueId) {
+        world.entities.delete(key);
+        return;
+      }
+    }
   });
 
   client.on("move_entity_absolute", (pkt: any) => {
     const id = BigInt(pkt.runtime_entity_id ?? 0n);
     const ent = world.entities.get(String(id));
     if (!ent) return;
-    if (pkt.position) ent.position = pkt.position;
+    if (pkt.position) {
+      ent.position = { x: pkt.position.x, y: pkt.position.y, z: pkt.position.z };
+    }
     if (pkt.rotation) {
       ent.pitch = pkt.rotation.x ?? ent.pitch;
       ent.yaw = pkt.rotation.z ?? ent.yaw;

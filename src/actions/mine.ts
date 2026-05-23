@@ -68,16 +68,27 @@ export async function mineBlock(
   const startedAt = Date.now();
 
   // Poll for block to become air (server confirms via update_block).
+  // We must distinguish two cases:
+  //   current.runtimeId === 0 → server confirmed: block is air (broken).
+  //   current === undefined   → no info (evicted from cache); block may still
+  //                             stand. Keep polling and return lost_view on
+  //                             timeout instead of falsely claiming success.
+  let sawInfo = false;
   while (Date.now() - startedAt < breakMs + 2000) {
     await new Promise((r) => setTimeout(r, 50));
     const current = world.getBlock(p);
-    if (!current || current.runtimeId === 0) {
-      sendAction("stop_break");
-      log.info(`broke ${block.name ?? block.runtimeId} at ${p.x},${p.y},${p.z}`);
-      return { broken: true };
+    if (current) {
+      sawInfo = true;
+      if (current.runtimeId === 0) {
+        sendAction("stop_break");
+        log.info(`broke ${block.name ?? block.runtimeId} at ${p.x},${p.y},${p.z}`);
+        return { broken: true };
+      }
     }
+    // current === undefined: cache eviction, keep polling.
   }
 
   sendAction("abort_break");
+  if (!sawInfo) return { broken: false, reason: "lost_view" };
   return { broken: false, reason: "timeout" };
 }

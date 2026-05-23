@@ -4,6 +4,8 @@ interface Snapshot {
   ts: number;
   health: number;
   food: number;
+  x: number;
+  z: number;
   totalCount: number;
   populatedItemIds: Set<number>;
 }
@@ -20,11 +22,20 @@ export class RewardCalculator {
     const snap = this.snapshot(world, ts);
     let reward = 0;
 
-    // Idle/urgency budget: +0.01 alive minus 0.001 mild urgency each tick.
-    reward += 0.01;
-    reward -= 0.001;
+    // No alive bonus — previously +0.01/tick caused a local-minimum where the
+    // policy learned to spam Jump forever (no risk, free reward). Movement now
+    // earns the only baseline positive signal.
 
     if (this.prev) {
+      // Movement reward: positive for actual horizontal displacement. Caps at
+      // 0.5 blocks/tick (sprint speed ≈ 0.28) so a teleport correction doesn't
+      // dump a giant reward. Encourages exploration without dwarfing item
+      // discovery.
+      const dx = snap.x - this.prev.x;
+      const dz = snap.z - this.prev.z;
+      const dist = Math.min(Math.sqrt(dx * dx + dz * dz), 0.5);
+      reward += dist * 0.05;
+
       // Health/hunger deltas.
       const dHealth = snap.health - this.prev.health;
       const dFood = snap.food - this.prev.food;
@@ -71,6 +82,8 @@ export class RewardCalculator {
       ts,
       health: world.self.health,
       food: world.self.food,
+      x: world.self.position.x,
+      z: world.self.position.z,
       totalCount,
       populatedItemIds: populated,
     };

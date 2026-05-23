@@ -40,7 +40,7 @@ export class TrajectoryLogger {
     log.info(`trajectory log → ${this.filePath}`);
   }
 
-  log(obs: Float32Array, action: ActionId, reward: number, meta?: object): void {
+  log(obs: Float32Array, action: ActionId, reward: number, terminal = false, meta?: object): void {
     if (this.closed) return;
     // Float32Array.buffer is the underlying ArrayBuffer; wrap it in a Buffer view
     // (no copy) and base64 it. Length is implicit (obs.length × 4 bytes).
@@ -53,6 +53,11 @@ export class TrajectoryLogger {
       reward,
       t: Date.now() - this.startedAt,
     };
+    // The Python DQN trainer (training/train_dqn.py) checks row.get("done") to
+    // mark a transition as terminal (done=True self-loop, no bootstrap). Without
+    // this, the -50 death reward gets blended through gamma*Q(next) and the
+    // bot never learns to stop dying.
+    if (terminal) record.done = true;
     if (meta !== undefined) record.meta = meta;
     this.queue.push(JSON.stringify(record) + "\n");
     this.kickFlush();
