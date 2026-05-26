@@ -4,6 +4,7 @@ import type { InputController } from "./input.js";
 import type { Vec3 } from "../utils/vec3.js";
 import { v3floor } from "../utils/vec3.js";
 import { safeQueue } from "../connection/version.js";
+import { isAirRuntimeId } from "../world/decoder.js";
 import { setIntent } from "../ml/intent.js";
 import { ActionId } from "../ml/actions.js";
 import { makeLogger } from "../utils/logger.js";
@@ -31,6 +32,8 @@ export async function placeBlock(
 
   const t = v3floor(target);
   const a = v3floor(against);
+  // Snapshot the target cell before placing so we can confirm a real change.
+  const beforeId = world.getBlock(t)?.runtimeId;
 
   input.lookAt({ x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 });
   setIntent(ActionId.PlaceFront, 500);
@@ -61,12 +64,15 @@ export async function placeBlock(
   }, "place");
   if (!ok) return { placed: false, reason: "tx_error" };
 
-  // Wait for update_block confirmation.
+  // Wait for update_block confirmation. Air is a world-specific NONZERO runtime
+  // id here (e.g. 13080), so we must confirm on "became a non-air block that
+  // differs from before", never on `runtimeId !== 0` (which treats air as a
+  // placed block and false-positives instantly). Same gotcha as mining.
   const deadline = Date.now() + 1500;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 50));
     const b = world.getBlock(t);
-    if (b && b.runtimeId !== 0) {
+    if (b && !isAirRuntimeId(b.runtimeId) && b.runtimeId !== beforeId) {
       log.info(`placed at ${t.x},${t.y},${t.z}`);
       return { placed: true };
     }

@@ -38,7 +38,7 @@ import torch.nn.functional as F
 
 # ---- observation layout constants (copied verbatim from train_bc.py) -----
 OBS_DIM = 605
-N_ACTIONS = 12
+N_ACTIONS = 16
 
 SELF_LO, SELF_HI = 0, 8                 # 8 continuous self stats
 

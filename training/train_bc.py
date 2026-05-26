@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader, Dataset
 
 # ---- observation layout constants ----------------------------------------
 OBS_DIM = 601
-N_ACTIONS = 12
+N_ACTIONS = 16
 
 SELF_LO, SELF_HI = 0, 8                 # 8 continuous self stats
 

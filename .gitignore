@@ -10,6 +10,8 @@ dist/
 
 # rollout data (large, runtime-generated)
 data/online/
+# archived rollout snapshots from a mode cutover, e.g. data/online_shadow_<ts>/
+data/online_*/
 
 # planner decision log (runtime-generated)
 src/llm/skills/

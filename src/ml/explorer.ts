@@ -21,6 +21,14 @@ interface ActionWeight {
   maxMs: number;
 }
 
+/** Inventory snapshot used to bias exploration toward feasible crafts. */
+export interface CraftHint {
+  logs: number;
+  planks: number;
+  sticks: number;
+  hasTable: boolean;
+}
+
 // Heavily biased toward movement so the bot actually goes places. Mining/placing
 // included so they appear in the training distribution.
 const WEIGHTS: ActionWeight[] = [
@@ -36,9 +44,31 @@ const WEIGHTS: ActionWeight[] = [
   { action: ActionId.Eat, weight: 2, minMs: 1500, maxMs: 2500 },
   { action: ActionId.MoveForwardJump, weight: 10, minMs: 400, maxMs: 1200 },
   { action: ActionId.Noop, weight: 2, minMs: 100, maxMs: 300 },
+  // Craft macros. Low base weight (tried occasionally even with no materials);
+  // boosted hard by applyHint() when the bot actually has the ingredients, so
+  // exploration generates real crafting transitions for the DQN to learn from.
+  { action: ActionId.CraftPlanks, weight: 4, minMs: 1500, maxMs: 3000 },
+  { action: ActionId.CraftSticks, weight: 3, minMs: 1500, maxMs: 3000 },
+  { action: ActionId.CraftCraftingTable, weight: 2, minMs: 1500, maxMs: 3000 },
+  { action: ActionId.CraftWoodenPickaxe, weight: 2, minMs: 1500, maxMs: 3000 },
 ];
 
 const TOTAL_WEIGHT = WEIGHTS.reduce((s, w) => s + w.weight, 0);
+
+// When the bot holds the right materials, sharply raise the weight of the
+// craft that becomes feasible so exploration actually triggers it (and the
+// tech-tree reward fires). Everything else keeps its base weight. This only
+// biases exploration; the DQN still has to learn the action values.
+function applyHint(hint: CraftHint): ActionWeight[] {
+  return WEIGHTS.map((w) => {
+    let weight = w.weight;
+    if (w.action === ActionId.CraftPlanks && hint.logs >= 1) weight = 40;
+    else if (w.action === ActionId.CraftSticks && hint.planks >= 2) weight = 30;
+    else if (w.action === ActionId.CraftCraftingTable && hint.planks >= 4 && !hint.hasTable) weight = 25;
+    else if (w.action === ActionId.CraftWoodenPickaxe && hint.planks >= 3 && hint.sticks >= 2 && hint.hasTable) weight = 35;
+    return { ...w, weight };
+  });
+}
 
 export class Explorer {
   private currentAction: ActionId = ActionId.Noop;
@@ -48,9 +78,9 @@ export class Explorer {
 
   /** Returns the action to execute at this tick. If we're still inside the
    * current sticky window, returns the same action; otherwise picks fresh. */
-  nextAction(now = Date.now()): ActionId {
+  nextAction(now = Date.now(), hint?: CraftHint): ActionId {
     if (now < this.untilTs) return this.currentAction;
-    const choice = this.pickWeighted();
+    const choice = this.pickWeighted(hint);
     this.currentAction = choice.action;
     this.untilTs = now + this.randIn(choice.minMs, choice.maxMs);
     this.actionsExecuted++;
@@ -58,13 +88,15 @@ export class Explorer {
     return this.currentAction;
   }
 
-  private pickWeighted(): ActionWeight {
-    let r = Math.random() * TOTAL_WEIGHT;
-    for (const w of WEIGHTS) {
+  private pickWeighted(hint?: CraftHint): ActionWeight {
+    const weights = hint ? applyHint(hint) : WEIGHTS;
+    const total = hint ? weights.reduce((s, w) => s + w.weight, 0) : TOTAL_WEIGHT;
+    let r = Math.random() * total;
+    for (const w of weights) {
       r -= w.weight;
       if (r <= 0) return w;
     }
-    return WEIGHTS[0]!;
+    return weights[0]!;
   }
 
   private randIn(lo: number, hi: number): number {

@@ -45,7 +45,7 @@ cd training && python train_dqn.py   # tails data/online/, rewrites models/polic
 
 **YOU MUST keep these in sync between TS and Python:**
 - `OBS_DIM = 605` (`src/ml/encoder.ts` and both `training/train_*.py`)
-- `ACTION_COUNT = 12` and the ActionId enum order (`src/ml/actions.ts` and trainer output dim)
+- `ACTION_COUNT = 16` and the ActionId enum order (`src/ml/actions.ts` **and** `src/ml/policy.ts` (separate literal to avoid the import cycle), and trainer output dim). Ids 0-11 are movement/mine/place/attack/eat; 12-15 are the craft macros (planks, sticks, crafting_table, wooden_pickaxe).
 - Observation layout: self[0..8), grid[8..413), entities[413..445), inv-slots[445..509), inv-bag[509..601), tree[601..605)
 - Trajectory JSONL schema: `{obs_b64, obs_len, action, reward, t, meta?}`. `obs_b64` is base64 of the raw Float32Array buffer.
 
@@ -55,7 +55,7 @@ Changing the obs or action space without updating both sides is a silent data co
 
 - **New GOAP action**: implement in `src/goap/actions/`, register in `actions/index.ts`, add to `IMPLEMENTATIONS` in `goap/executor.ts`.
 - **New packet handler**: bind in `src/world/perception.ts` (or appropriate `attach*`). Handlers MUST be attached before `waitForSpawn`.
-- **New primitive ML action**: update `ActionId` enum, `DIR_YAW`, `executeAction` switch, bump `ACTION_COUNT`, add to Explorer weights, update trainer output dim.
+- **New primitive ML action**: update `ActionId` enum, `DIR_YAW`, `executeAction` switch, bump `ACTION_COUNT` in **both** `src/ml/actions.ts` and `src/ml/policy.ts`, add to Explorer weights, update `N_ACTIONS` in both `training/train_*.py`.
 - **UI/frontend or user-facing prose**: no em dashes, no AI buzzwords (`leverage`, `robust`, `delve`, `comprehensive`, `moreover`). Plain dev voice. This applies to README, this file, code comments, and any public-facing docs.
 
 ## Not in git

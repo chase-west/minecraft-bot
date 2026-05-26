@@ -10,7 +10,9 @@ import { makeLogger } from "../utils/logger.js";
 // import the *type* below.
 import type { ActionId } from "./actions.js";
 
-const ACTION_COUNT = 12;
+// Kept in sync with ACTION_COUNT in actions.ts (12 movement/mine/etc + 4 craft).
+// Deliberately a local literal, not an import, to avoid the actions.ts cycle.
+const ACTION_COUNT = 16;
 const NOOP: ActionId = 0 as ActionId;
 
 const log = makeLogger("policy");

@@ -46,6 +46,12 @@ export class RewardCalculator {
   private prevTreeDist: number | null = null;
   // Count of wood items (logs/wood/planks) held on the previous tick.
   private prevWoodCount = 0;
+  // Tech-tree item counts held on the previous tick, for repeatable
+  // progression rewards (see step()).
+  private prevSticks = 0;
+  private prevTables = 0;
+  private prevWoodPicks = 0;
+  private prevCobble = 0;
 
   step(world: World, ts: number, lastAction?: ActionId): number {
     const snap = this.snapshot(world, ts);
@@ -132,6 +138,26 @@ export class RewardCalculator {
     if (dWood > 0) reward += dWood * 3.0;
     this.prevWoodCount = woodCount;
 
+    // --- Tech-tree progression -------------------------------------------
+    // Repeatable, delta-based rewards for advancing the early tech tree. These
+    // dwarf the wood/movement shaping so the policy learns the chain
+    // wood -> planks -> sticks -> table -> wooden pickaxe is worth pursuing,
+    // and keep paying out each time it advances (not just the first time).
+    // Planks are already covered by the wood reward above (1 log -> 4 planks
+    // is a net wood gain), so they are not double-counted here.
+    const sticks = this.countItem(world, "stick");
+    const tables = this.countItem(world, "crafting_table");
+    const woodPicks = this.countItem(world, "wooden_pickaxe");
+    const cobble = this.countItem(world, "cobblestone");
+    if (sticks > this.prevSticks) reward += (sticks - this.prevSticks) * 0.5;
+    if (tables > this.prevTables) reward += (tables - this.prevTables) * 4.0;
+    if (woodPicks > this.prevWoodPicks) reward += (woodPicks - this.prevWoodPicks) * 30.0;
+    if (cobble > this.prevCobble) reward += (cobble - this.prevCobble) * 1.0;
+    this.prevSticks = sticks;
+    this.prevTables = tables;
+    this.prevWoodPicks = woodPicks;
+    this.prevCobble = cobble;
+
     this.prev = snap;
     return reward;
   }
@@ -175,6 +201,15 @@ export class RewardCalculator {
     return total;
   }
 
+  /** Total count of inventory items whose name contains `substr`. */
+  private countItem(world: World, substr: string): number {
+    let total = 0;
+    for (const slot of world.inventory.values()) {
+      if (slot.count > 0 && slot.name && slot.name.includes(substr)) total += slot.count;
+    }
+    return total;
+  }
+
   private snapshot(world: World, ts: number): Snapshot {
     let totalCount = 0;
     const populated: Set<number> = new Set();
@@ -201,5 +236,9 @@ export class RewardCalculator {
     this.dead = false;
     this.prevTreeDist = null;
     this.prevWoodCount = 0;
+    this.prevSticks = 0;
+    this.prevTables = 0;
+    this.prevWoodPicks = 0;
+    this.prevCobble = 0;
   }
 }

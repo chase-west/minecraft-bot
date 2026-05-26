@@ -20,7 +20,7 @@ import { RewardCalculator } from "../ml/reward.js";
 import { TrajectoryLogger } from "../ml/trajectoryLogger.js";
 import { readIntent } from "../ml/intent.js";
 import { LearnedPolicy } from "../ml/policy.js";
-import { Explorer } from "../ml/explorer.js";
+import { Explorer, type CraftHint } from "../ml/explorer.js";
 import { executeAction, type ActionContext, ActionId } from "../ml/actions.js";
 import { makeLogger } from "../utils/logger.js";
 
@@ -139,7 +139,7 @@ export class Agent {
       try {
         const obs = this.encoder.encode(this.world, this.blockIdRegistry, scratch);
         const r = this.reward.step(this.world, Date.now(), this.stickyAction);
-        const ctx: ActionContext = { client: this.client, world: this.world, input: this.input };
+        const ctx: ActionContext = { client: this.client, world: this.world, input: this.input, recipes: this.recipes };
 
         // In online mode, the policy may become loaded later via hot-reload;
         // promote ourselves from explore → learned the moment it shows up.
@@ -187,8 +187,9 @@ export class Agent {
             .finally(() => { this.actInFlight = false; });
         } else if (this.exploreActive || epsilonRoll) {
           // Sticky random-walk — pure explore mode, or ε-greedy fresh-data
-          // sampling inside online mode.
-          const actionId = this.explorer.nextAction();
+          // sampling inside online mode. The craft hint biases exploration
+          // toward crafts the bot currently has materials for.
+          const actionId = this.explorer.nextAction(now, this.craftHint());
           const terminal = this.markTerminal; this.markTerminal = false;
           this.trajLogger!.log(obs, actionId, r, terminal);
           executeAction(actionId, ctx).catch((err) => {
@@ -219,6 +220,30 @@ export class Agent {
     const modeTag = isOnline ? "online" : this.learnedActive ? "learned" : this.exploreActive ? "explore" : "shadow";
     log.info(`ml ${modeTag} mode active: logging to data/online/*.jsonl @ 10Hz`);
     log.info(`agent initialized (llm=${this.llm.isEnabled() ? "on" : "off"}, combat_policy=${this.combatPolicy ? "loaded" : "fallback"}, ml_mode=${this.mlMode}, policy_loaded=${policyLoaded}, pos=${JSON.stringify(this.world.self.position)})`);
+  }
+
+  /**
+   * Cheap inventory snapshot used to bias the Explorer toward feasible crafts.
+   * Counts by name-substring (slot names look like "oak_planks"/"stick"). The
+   * crafting-table block scan only runs when a pickaxe is otherwise craftable,
+   * to keep this off the hot path.
+   */
+  private craftHint(): CraftHint {
+    let logs = 0, planks = 0, sticks = 0;
+    for (const slot of this.world.inventory.values()) {
+      const n = slot.name;
+      if (!n || slot.count <= 0) continue;
+      if (n.includes("log")) logs += slot.count;
+      else if (n.includes("planks")) planks += slot.count;
+      else if (n.includes("stick")) sticks += slot.count;
+    }
+    let hasTable = false;
+    if (planks >= 3 && sticks >= 2) {
+      for (const b of this.world.blocks.values()) {
+        if (b.name && b.name.includes("crafting_table")) { hasTable = true; break; }
+      }
+    }
+    return { logs, planks, sticks, hasTable };
   }
 
   /** Backwards-compatible single-call init (if no perception ordering needed). */
