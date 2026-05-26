@@ -11,6 +11,9 @@ dist/
 # rollout data (large, runtime-generated)
 data/online/
 
+# planner decision log (runtime-generated)
+src/llm/skills/
+
 # trained model artefacts (rebuild with training/train_dqn.py)
 models/*.onnx
 *.onnx.bak

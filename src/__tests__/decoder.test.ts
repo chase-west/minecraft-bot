@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { decodeSubChunk } from "../world/decoder.js";
 import { World } from "../world/world.js";
 import { findNearbyTree, findNearbyStone, inferGroundId } from "../world/semantic.js";
+import { resetLearnedLogIds } from "../world/logIds.js";
 
 function writeVarInt(buf: number[], value: number): void {
   while (value & ~0x7f) {
@@ -63,6 +64,7 @@ test("decoder: bits_per_block=1 with two-entry palette decodes correctly", () =>
 });
 
 test("semantic: findNearbyTree detects a 4-block log pillar WITH canopy", () => {
+  resetLearnedLogIds(); // auto-learned ids are process-global; isolate this test
   const world = new World();
   world.self.position = { x: 0, y: 64, z: 0 };
   // Ground (lots of id 1 stone)
@@ -87,6 +89,7 @@ test("semantic: findNearbyTree detects a 4-block log pillar WITH canopy", () => 
 });
 
 test("semantic: findNearbyTree REJECTS a pillar with no canopy", () => {
+  resetLearnedLogIds(); // don't inherit an id learned by an earlier test
   const world = new World();
   world.self.position = { x: 0, y: 64, z: 0 };
   for (let x = -8; x < 8; x++) for (let z = -8; z < 8; z++) {
@@ -98,6 +101,29 @@ test("semantic: findNearbyTree REJECTS a pillar with no canopy", () => {
   }
   const tree = findNearbyTree(world);
   assert.equal(tree, null, "naked pillar should not be reported as a tree");
+});
+
+test("semantic: findNearbyTree REJECTS a grounded leaf blob (no canopy-stripping)", () => {
+  // Regression: a dense block of identical "leaf" blocks resting on the ground
+  // passes the canopy + grounded gates (each interior column has a block below
+  // it and leaves all around). The old gate addLogId'd that id and the bot then
+  // stripped canopies instead of trunks. A leaf column is wide — flanked by
+  // same-id neighbours — so the thin-column test must reject it.
+  resetLearnedLogIds();
+  const world = new World();
+  world.self.position = { x: 0, y: 64, z: 0 };
+  for (let x = -8; x < 8; x++) for (let z = -8; z < 8; z++) {
+    world.setBlock({ x, y: 63, z }, { runtimeId: 1 }); // ground
+  }
+  // 3x3x5 leaf cuboid (id 88) sitting on the ground at (3,3): vertical runs of 5,
+  // every column flanked by same-id leaves, surrounded by a leaf "canopy".
+  for (let ox = -1; ox <= 1; ox++) for (let oz = -1; oz <= 1; oz++) {
+    for (let dy = 0; dy < 5; dy++) {
+      world.setBlock({ x: 3 + ox, y: 64 + dy, z: 3 + oz }, { runtimeId: 88 });
+    }
+  }
+  const tree = findNearbyTree(world);
+  assert.equal(tree, null, "a solid leaf blob must not be learned/reported as a tree");
 });
 
 test("semantic: findNearbyStone returns the dominant ground block near player", () => {

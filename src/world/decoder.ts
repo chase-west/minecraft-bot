@@ -29,8 +29,31 @@ export interface SubChunkBlock {
 
 export interface SubChunkDecoded {
   yIndex: number;             // signed y index of this subchunk (16-block units)
-  blocks: SubChunkBlock[];    // only non-zero (non-air) blocks
+  blocks: SubChunkBlock[];    // only non-air blocks
   palette: number[];          // unique runtime IDs that appeared in this subchunk
+}
+
+// --- Air id detection --------------------------------------------------------
+// On BDS the runtime id for minecraft:air is NOT 0 (it is server/version
+// specific — e.g. 13080 on this 1.26 world), and minecraft-data's state
+// numbering does not match what BDS sends, so we can neither hardcode it nor
+// pick the global mode (deep-underground stone outnumbers air across all
+// decoded subchunks). The reliable signal is the block at the BOT'S OWN head:
+// the server guarantees it is air. perception.ts samples it and calls
+// setDetectedAirId. Both 0 and the detected id count as air.
+let detectedAirId = 0;
+
+/** Set the runtime id BDS uses for air (from a known-air position, e.g. the bot's head). */
+export function setDetectedAirId(id: number): void {
+  if (id > 0) detectedAirId = id;
+}
+
+/** Runtime id BDS uses for air on this connection (0 until detected). */
+export function getDetectedAirId(): number { return detectedAirId; }
+
+/** True if `runtimeId` is air (canonical 0 or the detected id). */
+export function isAirRuntimeId(runtimeId: number): boolean {
+  return runtimeId === 0 || (detectedAirId !== 0 && runtimeId === detectedAirId);
 }
 
 class Cursor {
@@ -128,7 +151,7 @@ export function decodeSubChunk(payload: Buffer, defaultYIndex = 0): SubChunkDeco
       for (let y = 0; y < 16; y++) {
         const idx = (x << 8) | (z << 4) | y;
         const rid = firstLayerRuntimeIds[idx]!;
-        if (rid === 0) continue; // air
+        if (isAirRuntimeId(rid)) continue; // air (canonical 0 or detected id)
         seenIds.add(rid);
         blocks.push({ x, y, z, runtimeId: rid });
       }

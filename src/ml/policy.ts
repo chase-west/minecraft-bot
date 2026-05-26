@@ -41,7 +41,7 @@ interface PolicySession {
 }
 
 /**
- * Wraps an ONNX policy that maps a 601-dim observation to logits/Q-values
+ * Wraps an ONNX policy that maps a 605-dim observation to logits/Q-values
  * over the 12-action discrete space defined in `actions.ts`.
  *
  * Design notes:

@@ -62,6 +62,10 @@ const DIR_YAW: Readonly<Record<ActionId, number | null>> = {
   [ActionId.MoveForwardJump]: null,
 };
 
+// Guards against overlapping mineBlock calls (the online tick fires MineFront
+// fire-and-forget every 100ms; mineBlock runs for seconds). See MineFront case.
+let mineBusy = false;
+
 function frontBlock(world: World, distance = 1.5): Vec3 {
   const yawRad = (world.self.yaw * Math.PI) / 180;
   const px = world.self.position.x + Math.sin(-yawRad) * distance;
@@ -118,11 +122,19 @@ export async function executeAction(action: ActionId, ctx: ActionContext): Promi
       return;
     }
     case ActionId.MineFront: {
+      // One mine at a time. The online tick fires MineFront fire-and-forget
+      // every 100ms, and mineBlock runs for seconds; without this guard the
+      // overlapping calls all send start_break/predict_break at the same block
+      // and the server thrashes start<->stop, never completing a break.
+      if (mineBusy) return;
+      mineBusy = true;
       const target = frontBlock(world);
       try {
         await mineBlock(client, world, input, target);
       } catch (err) {
         log.warn("mineFront failed", (err as Error).message);
+      } finally {
+        mineBusy = false;
       }
       return;
     }

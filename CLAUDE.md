@@ -44,9 +44,9 @@ cd training && python train_dqn.py   # tails data/online/, rewrites models/polic
 ## Cross-language invariants
 
 **YOU MUST keep these in sync between TS and Python:**
-- `OBS_DIM = 601` (`src/ml/encoder.ts` and both `training/train_*.py`)
+- `OBS_DIM = 605` (`src/ml/encoder.ts` and both `training/train_*.py`)
 - `ACTION_COUNT = 12` and the ActionId enum order (`src/ml/actions.ts` and trainer output dim)
-- Observation layout: self[0..8), grid[8..413), entities[413..445), inv-slots[445..509), inv-bag[509..601)
+- Observation layout: self[0..8), grid[8..413), entities[413..445), inv-slots[445..509), inv-bag[509..601), tree[601..605)
 - Trajectory JSONL schema: `{obs_b64, obs_len, action, reward, t, meta?}`. `obs_b64` is base64 of the raw Float32Array buffer.
 
 Changing the obs or action space without updating both sides is a silent data corruption bug; the trainer happily learns garbage.

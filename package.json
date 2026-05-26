@@ -4,6 +4,12 @@
   "description": "Hybrid AI agent for Minecraft Bedrock Edition: LLM planner + GOAP + ML policies",
   "main": "dist/index.js",
   "type": "module",
+  "license": "MIT",
+  "author": "Chase West",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chase-west/minecraft-bot.git"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node --env-file=.env --enable-source-maps dist/index.js",

@@ -8,7 +8,7 @@ The goal was to see how far you can get without doing pixel-based RL. Turns out:
 
 One controller is in charge of the bot at a time. Which one is picked by `POLICY_MODE` in `.env`:
 
-- **`online`** (default): the DQN policy drives. Every 100ms it encodes the world into a 601-float observation, runs ONNX inference, and emits one of 12 discrete actions (move NSEW, jump, sprint toggle, mine front, place front, attack nearest, eat, move+jump, noop). Action choices are held for 400ms so the bot doesn't flicker. With probability `ONLINE_EPSILON` (default 0.15) it samples from the bootstrap explorer instead, to keep generating fresh data. The trainer in `training/train_dqn.py` watches `data/online/*.jsonl` rollouts and rewrites `models/policy.onnx` as it learns. The bot hot-reloads the file in place.
+- **`online`** (default): the DQN policy drives. Every 100ms it encodes the world into a 605-float observation, runs ONNX inference, and emits one of 12 discrete actions (move NSEW, jump, sprint toggle, mine front, place front, attack nearest, eat, move+jump, noop). Action choices are held for 400ms so the bot doesn't flicker. With probability `ONLINE_EPSILON` (default 0.15) it samples from the bootstrap explorer instead, to keep generating fresh data. The trainer in `training/train_dqn.py` watches `data/online/*.jsonl` rollouts and rewrites `models/policy.onnx` as it learns. The bot hot-reloads the file in place.
 - **`explore`**: no neural net at all. A sticky random-walk Explorer picks actions weighted toward movement so the bot generates diverse rollouts. This is the bootstrap mode used to seed training before any model exists.
 - **`shadow`**: GOAP drives the bot using A* over a symbolic state. The ML side runs in parallel and logs GOAP's chosen action as a supervision label, which is what behaviour cloning trains on.
 - **`learned`**: pure DQN argmax, no exploration. Eval mode.
@@ -41,7 +41,7 @@ shadow: |  LLM -> GOAP -> A* path    |  GOAP drives, ML side just logs labels
 
 Doing end-to-end RL on Minecraft pixels is a research project (see VPT, ~100K GPU hours). We don't have pixels, we have packets, which means we already get structured state for free. So the encoder is short, the action space is small, and a tiny DQN trained on a few hours of rollouts is competitive with the hand-written GOAP.
 
-- DQN: small (601 -> hidden -> 12 logits), fast to train, cheap to run
+- DQN: small (605 -> hidden -> 12 logits), fast to train, cheap to run
 - GOAP: deterministic baseline, used as a teacher in shadow mode
 - A*: navigation has been solved for years (mineflayer-pathfinder did it for Java)
 - LLM: open-ended goal picking when you want it, ignored otherwise

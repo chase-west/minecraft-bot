@@ -8,12 +8,14 @@ import { placeBlock } from "../actions/place.js";
 import { attackEntity, fleeFrom } from "../actions/combat.js";
 import { selectByName } from "../actions/inventory.js";
 import { navigateTo } from "../pathfinding/executor.js";
+import { isStandable, landingY } from "../pathfinding/safety.js";
 import { v3floor } from "../utils/vec3.js";
+import type { Vec3 } from "../utils/vec3.js";
 import { makeLogger } from "../utils/logger.js";
 import { RecipeRegistry } from "../crafting/registry.js";
 import { craftByOutputName } from "../crafting/craft.js";
 import { openCraftingTable, closeContainer, isContainerOpen } from "../crafting/container.js";
-import { findNearbyTree, findNearbyStone } from "../world/semantic.js";
+import { findNearbyTree, findNearbyStone, blacklistTree } from "../world/semantic.js";
 
 const log = makeLogger("goap-exec");
 
@@ -81,7 +83,11 @@ export const IMPLEMENTATIONS: Record<string, Impl> = {
       const r = await navigateTo(world, input, fallback, { timeoutMs: 60_000 });
       return { ok: r.arrived, reason: r.reason };
     }
-    const r = await navigateTo(world, input, tree, { timeoutMs: 60_000 });
+    // Navigate to a standable spot ADJACENT to the trunk, not the log itself
+    // (a solid block A* can't route into). If we can't find footing, fall back
+    // to the base so at least we get close.
+    const goal = findTreeStandSpot(world, tree) ?? tree;
+    const r = await navigateTo(world, input, goal, { timeoutMs: 60_000 });
     return { ok: r.arrived, reason: r.reason };
   },
 
@@ -90,35 +96,54 @@ export const IMPLEMENTATIONS: Record<string, Impl> = {
     if (selectByName(client, world, "axe")) { /* prefer axe */ }
     const tree = findNearbyTree(world) ?? findNearbyBlockByNameContains(world, "log");
     if (!tree) return { ok: false, reason: "no_tree" };
-    log.info(`tree found at (${tree.x},${tree.y},${tree.z}); bot at (${world.self.position.x.toFixed(1)},${world.self.position.y.toFixed(1)},${world.self.position.z.toFixed(1)}); world has ${world.blocks.size} blocks`);
-    // Try four cardinal stand-spots; first reachable wins. Each candidate sits at trunk.y
-    // (the trunk's base) so we're at eye-height with the bottom log.
-    const candidates = [
-      { x: tree.x + 1, y: tree.y, z: tree.z },
-      { x: tree.x - 1, y: tree.y, z: tree.z },
-      { x: tree.x, y: tree.y, z: tree.z + 1 },
-      { x: tree.x, y: tree.y, z: tree.z - 1 },
-    ];
-    let arrived = false;
-    let lastReason: string | undefined;
-    for (const spot of candidates) {
-      const nav = await navigateTo(world, input, spot, { timeoutMs: 30_000, maxNodes: 30_000 });
-      if (nav.arrived) { arrived = true; break; }
-      lastReason = nav.reason;
-    }
-    if (!arrived) return { ok: false, reason: `nav_to_tree:${lastReason ?? "unknown"}` };
     const trunkBlock = world.getBlock(tree);
     const trunkId = trunkBlock?.runtimeId;
+    // A tree is a VERTICAL COLUMN of logs from tree.y upward. We can chop ANY log in
+    // the column, so build the trunk column and target the log nearest to our own
+    // height — the base may be on a ledge we can't path down to.
+    const isLog = (b: { runtimeId: number; name?: string } | undefined): boolean =>
+      !!b && ((trunkId !== undefined && b.runtimeId === trunkId) || !!b.name?.includes("log"));
+    const column: Vec3[] = [];
+    for (let dy = 0; dy <= 6; dy++) {
+      const p = { x: tree.x, y: tree.y + dy, z: tree.z };
+      if (!isLog(world.getBlock(p))) break;
+      column.push(p);
+    }
+    if (column.length === 0) column.push({ x: tree.x, y: tree.y, z: tree.z });
+
+    // Stand on solid footing ADJACENT to the trunk before mining. Never mine
+    // from on top of / inside the trunk (that desyncs the bot and the server
+    // rejects the break). If we can't find footing from here, the tree is too
+    // far to perceive well — navigate toward the trunk first (A* stops at the
+    // nearest reachable cell, since the log itself is solid), then re-evaluate.
+    let standSpot = findTreeStandSpot(world, tree);
+    if (!standSpot) {
+      log.info(`tree at (${tree.x},${tree.y},${tree.z}): no footing from (${world.self.position.x.toFixed(1)},${world.self.position.y.toFixed(1)},${world.self.position.z.toFixed(1)}); navigating closer`);
+      await navigateTo(world, input, tree, { timeoutMs: 12_000, maxNodes: 30_000 });
+      standSpot = findTreeStandSpot(world, tree);
+    }
+    log.info(`tree at (${tree.x},${tree.y},${tree.z}) col=${column.length}; standSpot=${standSpot ? `(${standSpot.x},${standSpot.y},${standSpot.z})` : "none"}; bot at (${world.self.position.x.toFixed(1)},${world.self.position.y.toFixed(1)},${world.self.position.z.toFixed(1)})`);
+    if (!standSpot) { blacklistTree(tree); return { ok: false, reason: "no_stand_spot" }; }
+    const nav = await navigateTo(world, input, standSpot, { timeoutMs: 12_000, maxNodes: 30_000 });
+    if (!nav.arrived) { blacklistTree(tree); return { ok: false, reason: `nav_to_tree:${nav.reason ?? "unknown"}` }; }
+
+    // Mine the column bottom-up, skipping logs out of reach from where we
+    // actually stand (the base may be buried in a hillside). mineBlock()
+    // stabilizes (stops + waits for onGround) before each break. Tolerate a
+    // couple of misses rather than bailing on the first.
     let chopped = 0;
-    for (let dy = 0; dy < 7; dy++) {
-      const block = { x: tree.x, y: tree.y + dy, z: tree.z };
-      const here = world.getBlock(block);
-      if (!here) break;
-      const matches = (trunkId !== undefined && here.runtimeId === trunkId) || !!here.name?.includes("log");
-      if (!matches) break;
+    let fails = 0;
+    for (const block of column) {
+      if (!isLog(world.getBlock(block))) continue;
+      const ddx = block.x + 0.5 - world.self.position.x;
+      const ddy = block.y + 0.5 - (world.self.position.y + 1.62);
+      const ddz = block.z + 0.5 - world.self.position.z;
+      if (Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > 5.0) continue; // out of reach
+      const idBefore = world.getBlock(block)?.runtimeId;
       const r = await mineBlock(client, world, input, block);
+      log.info(`chop (${block.x},${block.y},${block.z}) id=${idBefore} broken=${r.broken}`);
       if (r.broken) chopped++;
-      else break;
+      else if (++fails >= 2) break;
     }
     return { ok: chopped > 0, reason: chopped === 0 ? "no_progress" : undefined };
   },
@@ -208,6 +233,59 @@ export const IMPLEMENTATIONS: Record<string, Impl> = {
     return { ok: placed > 0, reason: placed === 0 ? "no_placements" : undefined };
   },
 };
+
+/**
+ * Pick a block the bot can actually STAND on near the trunk — never the trunk
+ * column itself. Navigating to a log position (a solid block) makes A* fail to
+ * route ("no path"), and the straight-line fallback then walks the bot INTO the
+ * trunk, desyncing it (the server thinks it's inside a log) so every break is
+ * rejected. The four immediate neighbours are often blocked by the canopy
+ * (isSolid counts leaves as solid), so we scan a radius-2 area at the local
+ * floor (via landingY) for a genuinely clear, ground-supported spot from which
+ * at least one trunk log is within break reach, and return the one closest to
+ * the bot. Returns null only if nothing nearby is standable.
+ */
+function findTreeStandSpot(world: World, base: Vec3): Vec3 | null {
+  const REACH = 4.8; // Bedrock survival break reach is ~5-6 blocks; stay conservative.
+  const trunkId = world.getBlock(base)?.runtimeId;
+  const isLog = (b: { runtimeId: number; name?: string } | undefined): boolean =>
+    !!b && ((trunkId !== undefined && b.runtimeId === trunkId) || !!b.name?.includes("log"));
+  // Build the trunk column so we can test reach against any of its logs.
+  const column: Vec3[] = [];
+  for (let dy = 0; dy <= 8; dy++) {
+    const p = { x: base.x, y: base.y + dy, z: base.z };
+    if (!isLog(world.getBlock(p))) break;
+    column.push(p);
+  }
+  if (column.length === 0) column.push(base);
+
+  const bp = world.self.position;
+  let best: Vec3 | null = null;
+  let bestScore = Infinity;
+  for (let dx = -2; dx <= 2; dx++) {
+    for (let dz = -2; dz <= 2; dz++) {
+      if (dx === 0 && dz === 0) continue; // never the trunk column itself
+      // Find the floor in this column, scanning down from above the canopy base.
+      const floorY = landingY(world, { x: base.x + dx, y: base.y + 4, z: base.z + dz }, 10);
+      if (floorY === null) continue;
+      const spot = { x: base.x + dx, y: floorY, z: base.z + dz };
+      if (!isStandable(world, spot)) continue;
+      // Need at least one trunk log within break reach from the eye.
+      const eyeY = spot.y + 1.62;
+      const reachable = column.some((lp) => {
+        const ddx = lp.x + 0.5 - (spot.x + 0.5);
+        const ddy = lp.y + 0.5 - eyeY;
+        const ddz = lp.z + 0.5 - (spot.z + 0.5);
+        return Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) <= REACH;
+      });
+      if (!reachable) continue;
+      const score =
+        Math.abs(spot.x + 0.5 - bp.x) + Math.abs(spot.z + 0.5 - bp.z) + Math.abs(spot.y - bp.y);
+      if (score < bestScore) { bestScore = score; best = spot; }
+    }
+  }
+  return best;
+}
 
 function findNearbyBlockByNameContains(world: World, needle: string): { x: number; y: number; z: number } | null {
   let best: { x: number; y: number; z: number } | null = null;

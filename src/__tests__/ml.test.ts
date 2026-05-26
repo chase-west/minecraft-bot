@@ -22,14 +22,14 @@ test("BlockIdRegistry: air (runtime 0) always maps to dense 0", () => {
   assert.equal(reg.denseIndex(0), 0);
 });
 
-test("Encoder: produces a 601-long Float32Array", () => {
+test("Encoder: produces a 605-long Float32Array", () => {
   const world = new World();
   world.self.position = { x: 0, y: 64, z: 0 };
   world.self.health = 20; world.self.food = 18;
   const reg = new BlockIdRegistry("data/test-tmp");
   const enc = new Encoder();
   const obs = enc.encode(world, reg);
-  assert.equal(obs.length, 601);
+  assert.equal(obs.length, 605);
   // Self stats slice
   assert.equal(obs[0], 1.0); // health/20
   assert.ok(Math.abs((obs[1] ?? 0) - 18 / 20) < 1e-6); // food/20

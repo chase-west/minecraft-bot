@@ -1,5 +1,6 @@
 import type { World } from "../world/world.js";
 import type { Vec3 } from "../utils/vec3.js";
+import { isAirRuntimeId } from "../world/decoder.js";
 
 const HAZARD_NAMES = ["lava", "fire", "magma", "cactus", "wither_rose", "sweet_berry", "campfire", "cobweb"];
 
@@ -17,7 +18,7 @@ export function isWater(world: World, pos: Vec3): boolean {
 export function isSolid(world: World, pos: Vec3): boolean {
   const b = world.getBlock(pos);
   if (!b) return false; // unknown ⇒ treat as non-solid for pathfinding (caller decides)
-  if (b.runtimeId === 0) return false;
+  if (isAirRuntimeId(b.runtimeId)) return false; // air (0 or the detected nonzero id)
   if (!b.name) return true;
   if (b.name.includes("water") || b.name.includes("lava")) return false;
   if (b.name.includes("air")) return false;

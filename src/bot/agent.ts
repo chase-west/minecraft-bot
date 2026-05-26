@@ -3,6 +3,7 @@ import { World } from "../world/world.js";
 import { attachPerception, detachPerception } from "../world/perception.js";
 import { attachChunkStream, ChunkCache } from "../world/chunk.js";
 import { InputController } from "../actions/input.js";
+import { walkTo } from "../actions/move.js";
 import { ALL_ACTIONS } from "../goap/actions/index.js";
 import { ALL_GOALS } from "../goap/goals.js";
 import { plan, selectGoal } from "../goap/planner.js";
@@ -62,6 +63,7 @@ export class Agent {
   private learnedActive = false;
   private exploreActive = false;
   private actInFlight = false;
+  private goalFailStreak = 0;
   // Set by the bot_died event listener (perception emits this when health
   // crosses to ≤0). The next trajectory log call consumes the flag and writes
   // done=true so the DQN trainer treats that transition as terminal instead of
@@ -132,11 +134,11 @@ export class Agent {
     //   shadow  → record GOAP's intent (GOAP main loop drives the bot)
     this.trajLogger = new TrajectoryLogger("data/online");
     const isOnline = this.mlMode === "online";
-    const scratch = new Float32Array(601);
+    const scratch = new Float32Array(605);
     this.shadowHandle = setInterval(() => {
       try {
         const obs = this.encoder.encode(this.world, this.blockIdRegistry, scratch);
-        const r = this.reward.step(this.world, Date.now());
+        const r = this.reward.step(this.world, Date.now(), this.stickyAction);
         const ctx: ActionContext = { client: this.client, world: this.world, input: this.input };
 
         // In online mode, the policy may become loaded later via hot-reload;
@@ -247,7 +249,7 @@ export class Agent {
 
       // Pick a goal — LLM (if enabled) augments GOAP's utility scorer every few seconds.
       let goal = selectGoal(state, ALL_GOALS);
-      if (this.llm.isEnabled() && Date.now() - lastPlanAt > 8_000) {
+      if (this.llm.isEnabled() && Date.now() - lastPlanAt > 300_000) {
         const suggestion = await this.llm.suggestGoal(
           state,
           ALL_GOALS.map((g) => g.name),
@@ -282,8 +284,44 @@ export class Agent {
       const result = await executePlan(planResult, ctx);
       log.info(`plan result: completed=${result.completed}/${planResult.steps.length} failedAt=${result.failedAt} reason=${result.reason ?? "ok"}`);
 
-      await sleep(500);
+      // Back off when a goal makes zero progress, so we don't hammer the same
+      // failing plan (e.g. unreachable tree) hundreds of times per minute. Each
+      // consecutive zero-progress failure adds 2s of cooldown, capped at 15s,
+      // during which the LLM gets a chance to pick a different goal.
+      if (result.completed === 0) {
+        this.goalFailStreak++;
+        const backoff = Math.min(2000 * this.goalFailStreak, 15000);
+        log.warn(`goal ${goal.name} made no progress (streak=${this.goalFailStreak}); backing off ${backoff}ms`);
+        // Force the next iteration to re-query the LLM for a fresh goal.
+        lastPlanAt = 0;
+        // Only relocate after SEVERAL consecutive failures. Wandering on the
+        // first failure yanks the bot away before perception and navigation can
+        // settle — e.g. right after a teleport (chunk-follow briefly drops the
+        // target while it reprojects) or while A* is still routing to a tree the
+        // bot can already see. Give it a couple of cycles to stay put and make
+        // progress; only treat it as genuinely stuck (and wander to fresh
+        // ground) once it has failed repeatedly from the same place.
+        if (this.goalFailStreak >= 3) {
+          await this.wander();
+        } else {
+          await sleep(800);
+        }
+      } else {
+        this.goalFailStreak = 0;
+        await sleep(500);
+      }
     }
+  }
+
+  /** Walk in a random horizontal direction to escape a stuck goal. Keeps the bot
+   * visibly moving and relocates it so it can perceive (and reach) new targets. */
+  private async wander(): Promise<void> {
+    const ang = Math.random() * Math.PI * 2;
+    const dist = 12;
+    const p = this.world.self.position;
+    const target = { x: p.x + Math.cos(ang) * dist, y: p.y, z: p.z + Math.sin(ang) * dist };
+    log.info(`wandering toward (${target.x.toFixed(0)},${target.z.toFixed(0)}) to escape stuck goal`);
+    await walkTo(this.input, this.world, target, { sprint: true, allowJump: true, timeoutMs: 5000 });
   }
 
   stop(): void {

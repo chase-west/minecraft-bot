@@ -92,6 +92,12 @@ export async function fleeFrom(
     const yaw = Math.atan2(-dx, dz) * 180 / Math.PI;
     input.desired.lookYaw = yaw;
     input.setMove({ forward: 1, strafe: 0, sprint: true, jump: world.self.onGround });
+    // Publish a movement intent for the shadow trajectory logger so fleeing
+    // doesn't show up as a long run of Noops.
+    const fleeAction = Math.abs(dx) > Math.abs(dz)
+      ? (dx >= 0 ? ActionId.MoveE : ActionId.MoveW)
+      : (dz >= 0 ? ActionId.MoveS : ActionId.MoveN);
+    setIntent(fleeAction, 200);
     await new Promise((r) => setTimeout(r, 100));
   }
 }

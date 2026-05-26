@@ -1,5 +1,6 @@
 import type { BedrockClient } from "../connection/client.js";
 import type { World, EntityInfo } from "./world.js";
+import { setDetectedAirId } from "./decoder.js";
 import { makeLogger } from "../utils/logger.js";
 
 const log = makeLogger("perception");
@@ -140,6 +141,23 @@ export function attachPerception(client: BedrockClient, world: World): void {
       world.self.position = { x: pkt.position.x, y: pkt.position.y, z: pkt.position.z };
     }
   });
+
+  // Air id detection. BDS uses a NONZERO runtime id for air (e.g. 13080 here),
+  // which the chunk decoder cannot know up front. The block at the bot's own
+  // body + head is guaranteed air by the server, so we sample those two and,
+  // when they agree on a nonzero id, treat that id as air everywhere. Requiring
+  // agreement guards against a transient desync placing the bot inside a block.
+  let airLogged = false;
+  setInterval(() => {
+    const p = world.self.position;
+    const fx = Math.floor(p.x), fy = Math.floor(p.y), fz = Math.floor(p.z);
+    const body = world.getBlock({ x: fx, y: fy, z: fz })?.runtimeId;
+    const head = world.getBlock({ x: fx, y: fy + 1, z: fz })?.runtimeId;
+    if (body !== undefined && body !== 0 && body === head) {
+      setDetectedAirId(body);
+      if (!airLogged) { airLogged = true; log.info(`air runtime id detected: ${body}`); }
+    }
+  }, 2000);
 
   // Bedrock respawn handshake: server sends respawn(state=0=searching),
   // then respawn(state=1=server_ready). We MUST reply with state=2=client_ready
@@ -346,7 +364,8 @@ export function attachPerception(client: BedrockClient, world: World): void {
   // Single-block updates. Chunk decoding is intentionally NOT here — see world/chunk.ts.
   client.on("update_block", (pkt: any) => {
     if (!pkt.position) return;
-    world.setBlock(pkt.position, { runtimeId: pkt.block_runtime_id ?? 0 });
+    const rid = pkt.block_runtime_id ?? 0;
+    world.setBlock(pkt.position, { runtimeId: rid });
   });
 
   // Inventory sync (legacy). item_stack_request responses augment this for slot moves.

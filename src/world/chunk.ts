@@ -213,4 +213,32 @@ export function attachChunkStream(client: BedrockClient, world: World, cache: Ch
       }
     }
   });
+
+  // Perception must FOLLOW the bot. The level_chunk-driven requests above only
+  // fire for the chunks the server pushes near spawn, so without this the bot is
+  // blind anywhere it walks far or is teleported (world.blocks stays anchored at
+  // spawn). Every 2s, if the bot has moved >=2 chunks since the last request,
+  // request a 7x7 grid of subchunk columns around its current chunk and reproject
+  // cached blocks around it.
+  let lastReqCx = Infinity, lastReqCz = Infinity;
+  setInterval(() => {
+    if (world.self.runtimeEntityId === null) return; // not spawned yet
+    const cx = Math.floor(world.self.position.x / 16);
+    const cz = Math.floor(world.self.position.z / 16);
+    if (Math.abs(cx - lastReqCx) < 2 && Math.abs(cz - lastReqCz) < 2) return;
+    lastReqCx = cx; lastReqCz = cz;
+    const requests: Array<{ dx: number; dy: number; dz: number }> = [];
+    for (let dx = -3; dx <= 3; dx++) {
+      for (let dz = -3; dz <= 3; dz++) {
+        for (let dy = -4; dy <= 7; dy++) requests.push({ dx, dy, dz });
+      }
+    }
+    safeQueue(client, "subchunk_request", {
+      dimension: world.self.dimension,
+      origin: { x: cx, y: 0, z: cz },
+      requests,
+    }, "subchunk_req_follow");
+    reprojectAroundBot(world, cache);
+    log.info(`chunk-follow: requested ${requests.length} subchunks around chunk (${cx},${cz})`);
+  }, 2000);
 }

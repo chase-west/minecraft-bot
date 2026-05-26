@@ -37,7 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ---- observation layout constants (copied verbatim from train_bc.py) -----
-OBS_DIM = 601
+OBS_DIM = 605
 N_ACTIONS = 12
 
 SELF_LO, SELF_HI = 0, 8                 # 8 continuous self stats
@@ -66,7 +66,9 @@ INV_EMB = 8
 
 BAG_LO, BAG_HI = 509, 601               # 92 aggregate item count floats
 
-# Indices of the 160 continuous floats in the input vector (everything that
+TREE_LO, TREE_HI = 601, 605             # 4 nearest-tree floats: exists, dx, dz, dist
+
+# Indices of the 164 continuous floats in the input vector (everything that
 # is NOT an embedded int slot).
 _ENT_TYPE_SET = set(ENT_TYPE_POSITIONS)
 _INV_ID_SET = set(INV_ID_POSITIONS)
@@ -75,22 +77,23 @@ CONT_INDICES: List[int] = (
     + [i for i in range(ENT_LO, ENT_HI) if i not in _ENT_TYPE_SET]
     + [i for i in range(INV_LO, INV_HI) if i not in _INV_ID_SET]
     + list(range(BAG_LO, BAG_HI))
+    + list(range(TREE_LO, TREE_HI))
 )
-assert len(CONT_INDICES) == 160, f"continuous index count mismatch: {len(CONT_INDICES)}"
+assert len(CONT_INDICES) == 164, f"continuous index count mismatch: {len(CONT_INDICES)}"
 
 # Feature dims fed to the MLP trunk.
 _FEAT_DIM = (
     N_BLOCKS * BLOCK_EMB        # 6480
     + N_ENT * ENT_EMB           #   32
     + N_INV * INV_EMB           #  256
-    + len(CONT_INDICES)         #  160
+    + len(CONT_INDICES)         #  164
 )
-# 6480 + 32 + 256 + 160 = 6928
+# 6480 + 32 + 256 + 164 = 6932
 
 
 # ---- model (same architecture as BCPolicy, renamed QNet) -----------------
 class QNet(nn.Module):
-    """601-vec -> 12 Q-values with split embedding + MLP.
+    """605-vec -> 12 Q-values with split embedding + MLP.
 
     Architecturally identical to BCPolicy in train_bc.py so the Node-side
     ONNX runtime is none the wiser; the 12 outputs are treated as logits
@@ -127,7 +130,7 @@ class QNet(nn.Module):
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        # obs: (B, 601) float32
+        # obs: (B, 605) float32
         B = obs.size(0)
 
         block_ids = obs[:, BLOCK_LO:BLOCK_HI].long().clamp_(0, BLOCK_VOCAB - 1)
@@ -138,7 +141,7 @@ class QNet(nn.Module):
         ent_feat = self.ent_emb(ent_ids).reshape(B, N_ENT * ENT_EMB)
         inv_feat = self.inv_emb(inv_ids).reshape(B, N_INV * INV_EMB)
 
-        cont_feat = obs.index_select(1, self.cont_idx)  # (B, 160)
+        cont_feat = obs.index_select(1, self.cont_idx)  # (B, 164)
 
         x = torch.cat([block_feat, ent_feat, inv_feat, cont_feat], dim=1)
         return self.trunk(x)

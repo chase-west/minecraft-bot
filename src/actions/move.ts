@@ -9,6 +9,7 @@ import { makeLogger } from "../utils/logger.js";
 const log = makeLogger("move");
 
 const ARRIVE_DIST = 0.4;
+const ARRIVE_Y = 1.0;
 const STUCK_TIMEOUT_MS = 4000;
 const POLL_MS = 50;
 
@@ -16,6 +17,13 @@ export interface MoveOptions {
   sprint?: boolean;
   allowJump?: boolean;
   timeoutMs?: number;
+  /** Also require vertical proximity to count as arrived. Set for drop steps so
+   * the bot waits to actually fall onto the lower block instead of reporting
+   * "arrived" the instant it's XZ-over the target while still high on the ledge.
+   * The bot has no client-side gravity (server is authoritative for Y), so a
+   * descent only happens by standing XZ-over the landing cell and letting the
+   * server pull us down. Without this, drop steps silently no-op. */
+  requireArriveY?: boolean;
 }
 
 /** Walk in a straight line toward a target block-position. Returns when within ARRIVE_DIST or on timeout. */
@@ -32,10 +40,24 @@ export async function walkTo(
   while (Date.now() < deadline) {
     const p = world.self.position;
     const dist = v3distXZ(p, target);
-    if (dist < ARRIVE_DIST) {
+    const yClose = !opts.requireArriveY || Math.abs(p.y - target.y) <= ARRIVE_Y;
+    if (dist < ARRIVE_DIST && yClose) {
       input.setMove({ forward: 0, strafe: 0, jump: false, sprint: false });
       log.debug(`arrived at ${target.x.toFixed(2)},${target.z.toFixed(2)}`);
       return { arrived: true };
+    }
+
+    // Drop step: XZ-over the landing cell but still too high. Stop pushing
+    // forward (so we don't overshoot) and wait for the server's gravity to drop
+    // us onto the lower block — our stale high-Y prediction over an empty column
+    // makes the server pull us down. This is vertical progress, not a stall, so
+    // keep the stuck timer fresh.
+    if (dist < ARRIVE_DIST && !yClose) {
+      input.setMove({ forward: 0, strafe: 0, jump: false, sprint: false });
+      input.lookAt({ x: target.x, y: target.y + 1.62, z: target.z });
+      lastProgressAt = Date.now();
+      await new Promise((r) => setTimeout(r, POLL_MS));
+      continue;
     }
 
     if (dist < lastDist - 0.05) {
@@ -47,7 +69,16 @@ export async function walkTo(
     }
 
     input.lookAt({ x: target.x, y: p.y + 1.62, z: target.z });
-    const needJump = (opts.allowJump ?? true) && target.y - p.y > 0.5 && world.self.onGround;
+    // Jump when the planned step rises, OR when we've stalled against an
+    // obstacle: A* sometimes classifies a 1-block lip as a flat "walk" on the
+    // uneven ground around tree bases, so the bot pushes forward into it and the
+    // server clamps us in place (a stream of identical correct_player_move_prediction).
+    // The stall case intentionally drops the onGround guard — correct_player_move_prediction
+    // never refreshes onGround, so requiring it would suppress the very jump that
+    // frees us. predictPosition still gates the +0.42 rise on onGround, so an
+    // airborne jump bit is a harmless no-op.
+    const stalled = Date.now() - lastProgressAt > 600;
+    const needJump = (opts.allowJump ?? true) && (target.y - p.y > 0.5 || stalled);
     input.setMove({
       forward: 1,
       strafe: 0,

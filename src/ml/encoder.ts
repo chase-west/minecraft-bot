@@ -1,7 +1,8 @@
 import type { World, EntityInfo, InventorySlot } from "../world/world.js";
 import type { BlockIdRegistry } from "./blockIdRegistry.js";
+import { findNearbyTree } from "../world/semantic.js";
 
-export const OBS_DIM = 601;
+export const OBS_DIM = 605;
 
 // Layout offsets
 const SELF_OFFSET = 0;       // 8 floats
@@ -21,6 +22,10 @@ const INV_SLOT_FLOATS = 2;
 const INV_SLOTS_LEN = INV_SLOT_COUNT * INV_SLOT_FLOATS; // 64
 const INV_BAG_LEN = 92;
 const INV_LEN = INV_SLOTS_LEN + INV_BAG_LEN; // 156
+const TREE_OFFSET = INV_OFFSET + INV_LEN;             // 601
+const TREE_LEN = 4;
+const TREE_RANGE = 32;
+const TREE_RECOMPUTE_MS = 500;
 
 const ENTITY_RANGE = 16;
 const ENTITY_RANGE_SQ = ENTITY_RANGE * ENTITY_RANGE;
@@ -40,8 +45,13 @@ interface EntityCandidate {
 }
 
 export class Encoder {
+  // findNearbyTree scans world.blocks, which is too heavy to run every 100ms
+  // tick. Cache the last result and only rescan every TREE_RECOMPUTE_MS.
+  private lastTree: { x: number; y: number; z: number } | null = null;
+  private lastTreeAt = 0;
+
   /**
-   * Encode the current world snapshot into a 601-float vector.
+   * Encode the current world snapshot into a 605-float vector.
    *
    * The grid samples block runtime IDs and translates each to its dense
    * registry index. Entity and inventory blocks emit dense integer indices
@@ -56,6 +66,7 @@ export class Encoder {
     this.writeGrid(world, registry, out);
     this.writeEntities(world, registry, out);
     this.writeInventory(world, registry, out);
+    this.writeTree(world, out);
 
     return out;
   }
@@ -157,5 +168,35 @@ export class Encoder {
       const v = out[bagBase + i] ?? 0;
       out[bagBase + i] = clamp(v, 0, 1);
     }
+  }
+
+  private writeTree(world: World, out: Float32Array): void {
+    // findNearbyTree walks world.blocks, so reuse the cached hit between
+    // refreshes; rescan at most every TREE_RECOMPUTE_MS.
+    const now = Date.now();
+    if (now - this.lastTreeAt >= TREE_RECOMPUTE_MS) {
+      this.lastTree = findNearbyTree(world);
+      this.lastTreeAt = now;
+    }
+
+    const tree = this.lastTree;
+    const base = TREE_OFFSET;
+    const sp = world.self.position;
+    if (tree) {
+      const dx = tree.x - sp.x;
+      const dz = tree.z - sp.z;
+      const horizontalDist = Math.sqrt(dx * dx + dz * dz);
+      out[base + 0] = 1;                              // tree exists
+      out[base + 1] = clamp(dx / TREE_RANGE, -1, 1);  // east/west direction
+      out[base + 2] = clamp(dz / TREE_RANGE, -1, 1);  // north/south direction
+      out[base + 3] = clamp(horizontalDist / TREE_RANGE, 0, 1); // normalized distance
+    } else {
+      out[base + 0] = 0;
+      out[base + 1] = 0;
+      out[base + 2] = 0;
+      out[base + 3] = 1; // no tree -> max (far) distance
+    }
+    // TREE_LEN documents the layout, not a loop bound.
+    void TREE_LEN;
   }
 }

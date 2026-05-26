@@ -52,6 +52,16 @@ export interface DesiredMove {
   lookPitch?: number; // degrees
 }
 
+/** One block_action entry to inject into the next player_auth_input frame.
+ * Mirrors the schema: { action: Action, position: vec3i, face: zigzag32 }.
+ * Only the break-related actions (start/abort/crack/predict/continue) carry
+ * position+face per the schema's anon switch on `action`. */
+export interface PendingBlockAction {
+  action: "start_break" | "crack_break" | "continue_break" | "predict_break" | "abort_break";
+  position: Vec3;
+  face: number;
+}
+
 const TICK_MS = 50; // 20 Hz
 
 export class InputController {
@@ -59,6 +69,9 @@ export class InputController {
   private tickCount = 0n;
   private lastSent = { x: 0, y: 0, z: 0 };
   private flags: VersionFlags | null = null;
+  /** block_action entries queued for the NEXT auth_input frame, then cleared.
+   * Server-authoritative mining is driven entirely through this stream. */
+  private pendingBlockActions: PendingBlockAction[] = [];
   desired: DesiredMove = { forward: 0, strafe: 0, jump: false, sneak: false, sprint: false };
 
   constructor(private readonly client: BedrockClient, private readonly world: World) {}
@@ -79,6 +92,18 @@ export class InputController {
 
   setMove(desired: Partial<DesiredMove>): void {
     this.desired = { ...this.desired, ...desired };
+  }
+
+  /** Queue a block_action to be sent on the next player_auth_input tick.
+   * This is the server-authoritative survival mining channel: a sustained
+   * sequence of start_break → crack_break* → predict_break, one entry per tick.
+   * The entry is consumed (sent once) on the next tick and then cleared. */
+  setBlockAction(
+    action: PendingBlockAction["action"],
+    position: Vec3,
+    face: number,
+  ): void {
+    this.pendingBlockActions.push({ action, position: { ...position }, face });
   }
 
   /** Aim at a world position. */
@@ -112,7 +137,10 @@ export class InputController {
     return flags;
   }
 
-  /** Predict the next position from desired horizontal motion. Lets the server validate cheaply. */
+  /** Predict the next position from desired horizontal motion. Lets the server validate cheaply.
+   * No client-side gravity: the server is authoritative for vertical motion and corrects via
+   * move_player. (A client gravity attempt regressed movement — it fought the server's resting
+   * height and froze the bot — so vertical is left to the server.) */
   private predictPosition(d: DesiredMove): Vec3 {
     const yawRad = ((this.desired.lookYaw ?? this.world.self.yaw) * Math.PI) / 180;
     const speed = d.sprint ? 0.28 : 0.21; // approx blocks/tick on land
@@ -133,6 +161,21 @@ export class InputController {
     const inputData = this.buildInputData(d);
     const predicted = this.predictPosition(d);
     this.lastSent = predicted;
+
+    // Drain any queued block_action entries for THIS frame. The schema gates
+    // the block_action field on the `block_action` input flag: if the flag is
+    // not set, the serializer omits the field entirely (compareTo === "true").
+    const blockActions = this.pendingBlockActions;
+    this.pendingBlockActions = [];
+    if (blockActions.length > 0) {
+      inputData.block_action = true;
+      // REQUIRED for server-authoritative block breaking: this flag tells the
+      // server to run its delayed (timed) break and apply the destroy when the
+      // timer completes. Without it the server starts the break but never
+      // reaches the completion path — the block cracks then resets and never
+      // breaks. Set it on every tick that carries a break block_action.
+      inputData.block_breaking_delay_enabled = true;
+    }
 
     // We optimistically update our position; the server will correct via move_player if wrong.
     this.world.self.position = predicted;
@@ -170,6 +213,18 @@ export class InputController {
       camera_orientation: camDir,
       raw_move_vector: { x: d.strafe, z: d.forward },
     };
+    // block_action: switch on input_data.block_action; when true it's a
+    // length-prefixed (zigzag32 count) array of { action, position: vec3i,
+    // face: zigzag32 }. position uses {x,y,z} signed ints. Only emit when the
+    // gating flag is set, otherwise the serializer would try to read the field
+    // and find it undefined.
+    if (blockActions.length > 0) {
+      payload.block_action = blockActions.map((ba) => ({
+        action: ba.action,
+        position: { x: ba.position.x, y: ba.position.y, z: ba.position.z },
+        face: ba.face,
+      }));
+    }
     try {
       this.client.queue("player_auth_input" as any, payload);
     } catch (err) {

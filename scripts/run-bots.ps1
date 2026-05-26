@@ -136,7 +136,9 @@ function Start-Bot {
     $prevEps  = $env:ONLINE_EPSILON
     try {
         $env:BEDROCK_USERNAME = $bot.Username
-        $env:POLICY_MODE      = "online"
+        # POLICY_MODE inherits from .env (shadow/online/learned/explore). We do
+        # NOT hardcode it here so the user can pick the regime in .env without
+        # editing the supervisor.
         $env:ONLINE_EPSILON   = ([string]$bot.Epsilon)
 
         $proc = Start-Process -FilePath $nodeExe `
