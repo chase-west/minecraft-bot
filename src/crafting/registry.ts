@@ -3,12 +3,20 @@ import { makeLogger } from "../utils/logger.js";
 
 const log = makeLogger("recipes");
 
+export interface RecipeIngredient {
+  name?: string;             // e.g. "oak_planks" (string_id_meta descriptors)
+  tag?: string;              // e.g. "planks" (item_tag descriptors — any matching item works)
+  networkId?: number;        // item network id (int_id_meta descriptors)
+  count: number;
+  metadata?: number;
+}
+
 export interface RecipeEntry {
   recipeId: string;          // e.g. "minecraft:oak_planks"
   networkId: number;         // server-assigned, used in craft_recipe action
   outputName?: string;       // e.g. "oak_planks"
   outputCount?: number;
-  inputs: Array<{ name?: string; count?: number; metadata?: number }>;
+  inputs: RecipeIngredient[];
   width?: number;            // 1..3
   height?: number;           // 1..3
   needsTable: boolean;       // true if pattern won't fit 2x2
@@ -89,20 +97,31 @@ function parseRecipe(r: any): RecipeEntry | null {
   const outputName = stripMc(firstOut?.name ?? firstOut?.item_name);
   const outputCount = firstOut?.count ?? firstOut?.stack_size ?? 1;
 
-  // Inputs
+  // Inputs. Shaped recipes deliver a width×height NESTED array of ingredients
+  // (empty cells included); shapeless recipes deliver a flat array. Flatten
+  // first, then aggregate identical ingredients so a 3-plank row becomes one
+  // {planks, count:3} entry instead of three count:1 entries.
   const inputArr = data.input ?? data.ingredients ?? data.inputs ?? [];
-  const inputs: RecipeEntry["inputs"] = [];
+  const flat: any[] = [];
   for (const i of (Array.isArray(inputArr) ? inputArr : [inputArr])) {
-    if (!i || i.network_id === 0) continue;
-    inputs.push({
-      name: stripMc(i.name ?? i.item_name ?? i.descriptor?.identifier),
-      count: i.count ?? 1,
-      metadata: i.metadata,
-    });
+    if (Array.isArray(i)) flat.push(...i);
+    else flat.push(i);
   }
+  const byKey = new Map<string, RecipeIngredient>();
+  for (const i of flat) {
+    const ing = parseIngredient(i);
+    if (!ing) continue;
+    const key = ing.name ?? ing.tag ?? `id:${ing.networkId}`;
+    const existing = byKey.get(key);
+    if (existing) existing.count += ing.count;
+    else byKey.set(key, ing);
+  }
+  const inputs = Array.from(byKey.values());
 
-  // 2x2 capable when width≤2 AND height≤2 AND type is shapeless OR shaped 2x2
-  const needsTable = type === "shaped" ? ((width ?? 0) > 2 || (height ?? 0) > 2) : false;
+  // 2x2 capable when shaped pattern fits 2x2, or shapeless with ≤4 distinct inputs.
+  const needsTable = type === "shaped" || type === "shaped_chemistry"
+    ? ((width ?? 0) > 2 || (height ?? 0) > 2)
+    : inputs.length > 4;
 
   return {
     recipeId,
@@ -114,6 +133,29 @@ function parseRecipe(r: any): RecipeEntry | null {
     height,
     needsTable,
   };
+}
+
+/**
+ * Parse one RecipeIngredient from the wire. bedrock-protocol flattens the
+ * descriptor variant into the ingredient object, so the shape depends on type:
+ *   string_id_meta → { type, name, metadata, count }
+ *   item_tag       → { type, tag, count }          (any item with the tag works)
+ *   int_id_meta    → { type, network_id, metadata, count }
+ *   invalid        → empty grid cell, skip
+ * Older bedrock-protocol versions used { descriptor: {...} } nesting; keep
+ * those fallbacks so the parser survives lib upgrades.
+ */
+function parseIngredient(i: any): RecipeIngredient | null {
+  if (!i) return null;
+  const kind = i.type ?? i.descriptor_type;
+  if (kind === "invalid" || kind === "molang") return null;
+  const count = typeof i.count === "number" && i.count > 0 ? i.count : 1;
+  const name = stripMc(i.name ?? i.item_name ?? i.descriptor?.identifier ?? i.descriptor?.name);
+  const tag = stripMc(i.tag ?? i.descriptor?.tag);
+  const networkId = typeof i.network_id === "number" ? i.network_id : i.descriptor?.network_id;
+  if (networkId === 0) return null; // empty slot in older formats
+  if (!name && !tag && typeof networkId !== "number") return null;
+  return { name, tag, networkId, count };
 }
 
 function stripMc(name?: string): string | undefined {

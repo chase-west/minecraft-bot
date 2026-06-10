@@ -55,6 +55,11 @@ export class World {
   readonly blocks: BlockMap = new Map();
   readonly entities: Map<string, EntityInfo> = new Map(); // key = runtimeEntityId as string
   readonly inventory: Map<number, InventorySlot> = new Map(); // slot index → contents
+  // Item palette from start_game.itemstates (<=1.21.50) or the item_registry
+  // packet (1.21.60+): item network id → name ("oak_log", no "minecraft:"
+  // prefix). Wire-format item stacks carry only numeric ids, so every
+  // name-based lookup (crafting, rewards, selectByName) depends on this map.
+  readonly itemNames: Map<number, string> = new Map();
   readonly self: SelfState = {
     runtimeEntityId: null,
     position: { x: 0, y: 0, z: 0 },
@@ -112,6 +117,20 @@ export class World {
       if (d2 < bestD) { bestD = d2; best = e; }
     }
     return best;
+  }
+
+  /** Record the item palette. Entries look like {name: "minecraft:oak_log", runtime_id: n}. */
+  registerItemStates(states: Array<{ name?: string; runtime_id?: number }>): void {
+    for (const s of states) {
+      if (!s || typeof s.runtime_id !== "number" || !s.name) continue;
+      const name = s.name.startsWith("minecraft:") ? s.name.slice("minecraft:".length) : s.name;
+      this.itemNames.set(s.runtime_id, name);
+    }
+  }
+
+  /** Name for an item network id, or undefined if the palette hasn't loaded. */
+  itemName(networkId: number): string | undefined {
+    return this.itemNames.get(networkId);
   }
 
   itemCount(name: string): number {

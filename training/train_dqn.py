@@ -9,7 +9,7 @@ Long-lived process that runs alongside the bot:
 
 The observation layout and Q-network architecture are copied VERBATIM from
 training/train_bc.py so the Node-side ONNX loader (src/ml/policy.ts,
-src/ml/runtime.ts) keeps working. The output of size 12 is interpreted as
+src/ml/runtime.ts) keeps working. The output of size 16 is interpreted as
 logits by argmax on the Node side, which is also valid for Q-values.
 
 Usage:
@@ -93,10 +93,10 @@ _FEAT_DIM = (
 
 # ---- model (same architecture as BCPolicy, renamed QNet) -----------------
 class QNet(nn.Module):
-    """605-vec -> 12 Q-values with split embedding + MLP.
+    """605-vec -> 16 Q-values with split embedding + MLP.
 
     Architecturally identical to BCPolicy in train_bc.py so the Node-side
-    ONNX runtime is none the wiser; the 12 outputs are treated as logits
+    ONNX runtime is none the wiser; the 16 outputs are treated as logits
     via argmax, which works for Q-values too.
     """
 
@@ -234,9 +234,11 @@ class _FileState:
     def __init__(self) -> None:
         self.cursor: int = 0
         # Last parsed row from this file that has not yet been paired with a
-        # successor: (obs, action, reward). Held until a new row arrives so
-        # we can emit a (s, a, r, s', done=False) transition.
-        self.pending: Optional[Tuple[np.ndarray, int, float]] = None
+        # successor: (obs, action). The reward logged on row t is the reward
+        # accrued SINCE row t-1 (i.e. the payoff of action a_{t-1}), so the
+        # transition is (s_{t-1}, a_{t-1}, r_t, s_t) — the reward comes from
+        # the successor row, not the pending one.
+        self.pending: Optional[Tuple[np.ndarray, int]] = None
         # Bytes from an incomplete final line of a previous read, to prepend
         # next time around.
         self.leftover: str = ""
@@ -359,18 +361,18 @@ class Daemon:
                 explicit_done = bool(row.get("done") or row.get("terminal"))
 
                 if state.pending is not None:
-                    ps, pa, pr = state.pending
-                    self.buffer.push(ps, pa, pr, obs, False)
+                    # This row's reward belongs to the PREVIOUS action (it was
+                    # accrued between the two rows). A done row marks the
+                    # previous transition terminal — the -50 death reward then
+                    # propagates without bootstrap-bleed through gamma*Q(next).
+                    ps, pa = state.pending
+                    self.buffer.push(ps, pa, rew, obs, explicit_done)
                     added += 1
 
                 if explicit_done:
-                    # Terminal: emit (obs, act, rew, obs, True) self-loop so
-                    # we still capture the terminal reward, then clear.
-                    self.buffer.push(obs, act_i, rew, obs, True)
-                    added += 1
                     state.pending = None
                 else:
-                    state.pending = (obs, act_i, rew)
+                    state.pending = (obs, act_i)
 
         return added
 

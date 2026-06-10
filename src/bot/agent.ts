@@ -52,6 +52,12 @@ export class Agent {
   private readonly policyStickyMs = Number(process.env.POLICY_STICKY_MS ?? "400");
   private stickyAction: ActionId = ActionId.Noop;
   private stickyUntil = 0;
+  // Reward accrued since the last logged trajectory row. The reward calculator
+  // runs every 100ms tick, but in learned/online mode rows are only written at
+  // decision boundaries (~every POLICY_STICKY_MS). Without accumulation the
+  // reward earned on sticky ticks (e.g. a log landing in the inventory mid-
+  // window) was silently dropped, so the DQN never saw most of the payoff.
+  private rewardAccum = 0;
   private readonly blockIdRegistry = new BlockIdRegistry();
   private readonly encoder = new Encoder();
   private readonly reward = new RewardCalculator();
@@ -138,7 +144,8 @@ export class Agent {
     this.shadowHandle = setInterval(() => {
       try {
         const obs = this.encoder.encode(this.world, this.blockIdRegistry, scratch);
-        const r = this.reward.step(this.world, Date.now(), this.stickyAction);
+        this.rewardAccum += this.reward.step(this.world, Date.now(), this.stickyAction);
+        const r = this.rewardAccum;
         const ctx: ActionContext = { client: this.client, world: this.world, input: this.input, recipes: this.recipes };
 
         // In online mode, the policy may become loaded later via hot-reload;
@@ -168,9 +175,12 @@ export class Agent {
             if (this.shadowSamples < 5) log.warn(`sticky action ${this.stickyAction} failed: ${(err as Error).message}`);
           });
         } else if (useLearned && !epsilonRoll) {
-          // Fire-and-forget inference. Snapshot obs before handing off.
+          // Fire-and-forget inference. Snapshot obs before handing off. The
+          // reward accumulator resets NOW (not in .then) so ticks that elapse
+          // during inference accrue to the next row, not this one.
           const obsCopy = new Float32Array(obs);
           const terminal = this.markTerminal; this.markTerminal = false;
+          this.rewardAccum = 0;
           this.actInFlight = true;
           this.policy.act(obsCopy)
             .then(async (actionId) => {
@@ -191,7 +201,11 @@ export class Agent {
           // toward crafts the bot currently has materials for.
           const actionId = this.explorer.nextAction(now, this.craftHint());
           const terminal = this.markTerminal; this.markTerminal = false;
+          // Track the chosen action so the reward calculator's action-aware
+          // shaping (e.g. the MineFront aim bonus) sees it next tick.
+          this.stickyAction = actionId;
           this.trajLogger!.log(obs, actionId, r, terminal);
+          this.rewardAccum = 0;
           executeAction(actionId, ctx).catch((err) => {
             if (this.shadowSamples < 5) log.warn(`explore action ${actionId} failed: ${(err as Error).message}`);
           });
@@ -200,6 +214,7 @@ export class Agent {
           const intent = readIntent();
           const terminal = this.markTerminal; this.markTerminal = false;
           this.trajLogger!.log(obs, intent, r, terminal);
+          this.rewardAccum = 0;
         }
 
         this.shadowSamples++;

@@ -1,6 +1,6 @@
 import type { BedrockClient } from "../connection/client.js";
 import type { World } from "../world/world.js";
-import type { RecipeRegistry, RecipeEntry } from "./registry.js";
+import type { RecipeRegistry, RecipeEntry, RecipeIngredient } from "./registry.js";
 import { nextRequestId } from "./request_id.js";
 import { safeQueue } from "../connection/version.js";
 import { makeLogger } from "../utils/logger.js";
@@ -52,15 +52,40 @@ function findFreeHotbar(world: World): number {
   return 0; // overwrite slot 0 if nothing free
 }
 
-function findIngredient(world: World, ingredient: { name?: string }): { slot: number; stackId: number } | null {
-  if (!ingredient.name) return null;
+/**
+ * True when an inventory item satisfies a recipe ingredient. Three descriptor
+ * kinds: exact item network id, name substring, or item tag. Tags arrive like
+ * "logs"/"planks"/"wooden_tool_materials"; we approximate with substring checks
+ * against the singular form ("logs" matches "oak_log").
+ */
+function matchesIngredient(item: { networkId: number; name?: string }, ing: RecipeIngredient): boolean {
+  if (typeof ing.networkId === "number" && ing.networkId === item.networkId) return true;
+  if (!item.name) return false;
+  if (ing.name && item.name.includes(ing.name)) return true;
+  if (ing.tag) {
+    const tag = ing.tag.endsWith("s") ? ing.tag.slice(0, -1) : ing.tag;
+    if (item.name.includes(tag)) return true;
+    // "logs_that_burn" / "wooden_*" style tags: match on the first segment.
+    const head = tag.split("_")[0];
+    if (head && head.length >= 3 && item.name.includes(head)) return true;
+  }
+  return false;
+}
+
+function findIngredient(world: World, ingredient: RecipeIngredient): { slot: number; stackId: number; available: number } | null {
   for (const [slot, item] of world.inventory.entries()) {
-    if (item.name?.includes(ingredient.name) && item.count > 0) {
+    if (item.count > 0 && matchesIngredient(item, ingredient)) {
       // stackId would be tracked from inventory_slot packets; default 0 = "any/ignore" works on most servers.
-      return { slot, stackId: 0 };
+      return { slot, stackId: 0, available: item.count };
     }
   }
   return null;
+}
+
+/** item_stack_request addresses hotbar slots (0-8) and main inventory (9-35)
+ * as separate containers, both with absolute slot indices. */
+function containerForSlot(slot: number): string {
+  return slot < 9 ? CONTAINER_HOTBAR : CONTAINER_INVENTORY;
 }
 
 export async function craft(
@@ -74,14 +99,24 @@ export async function craft(
   const destSlot = opts.destHotbarSlot ?? findFreeHotbar(world);
   const timesCrafted = opts.times ?? 1;
 
-  // Map ingredients to their current inventory slots.
-  const consumes: Array<{ slot: number; stackId: number; count: number }> = [];
+  // Map ingredients to their current inventory slots, merging ingredients that
+  // resolve to the same slot (e.g. planks appearing in several grid cells).
+  const bySlot = new Map<number, { slot: number; stackId: number; count: number; available: number }>();
   for (const ing of recipe.inputs) {
     const found = findIngredient(world, ing);
     if (!found) {
-      return { crafted: false, reason: `missing_ingredient:${ing.name}` };
+      return { crafted: false, reason: `missing_ingredient:${ing.name ?? ing.tag ?? ing.networkId}` };
     }
-    consumes.push({ ...found, count: (ing.count ?? 1) * timesCrafted });
+    const need = (ing.count ?? 1) * timesCrafted;
+    const existing = bySlot.get(found.slot);
+    if (existing) existing.count += need;
+    else bySlot.set(found.slot, { ...found, count: need });
+  }
+  const consumes = Array.from(bySlot.values());
+  for (const c of consumes) {
+    if (c.count > c.available) {
+      return { crafted: false, reason: `not_enough:slot${c.slot}:need${c.count}:have${c.available}` };
+    }
   }
 
   // Build the action list.
@@ -97,7 +132,7 @@ export async function craft(
       type_id: "consume",
       count: c.count,
       source: {
-        slot_type: { container_id: CONTAINER_INVENTORY, dynamic_container_id: 0 },
+        slot_type: { container_id: containerForSlot(c.slot), dynamic_container_id: undefined },
         slot: c.slot,
         stack_id: c.stackId,
       },
@@ -107,12 +142,12 @@ export async function craft(
     type_id: "take",
     count: (recipe.outputCount ?? 1) * timesCrafted,
     source: {
-      slot_type: { container_id: CONTAINER_CREATIVE_OUTPUT, dynamic_container_id: 0 },
+      slot_type: { container_id: CONTAINER_CREATIVE_OUTPUT, dynamic_container_id: undefined },
       slot: 50,
       stack_id: 0,
     },
     destination: {
-      slot_type: { container_id: CONTAINER_HOTBAR, dynamic_container_id: 0 },
+      slot_type: { container_id: CONTAINER_HOTBAR, dynamic_container_id: undefined },
       slot: destSlot,
       stack_id: 0,
     },

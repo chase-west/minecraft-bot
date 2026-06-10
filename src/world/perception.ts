@@ -72,6 +72,13 @@ export function attachPerception(client: BedrockClient, world: World): void {
     }
     if (typeof pkt.player_gamemode === "number") world.self.gameMode = pkt.player_gamemode;
     if (typeof pkt.dimension === "number") world.self.dimension = pkt.dimension;
+
+    // Item palette (id → name). Lives in start_game.itemstates through 1.21.50;
+    // 1.21.60+ moved it to the dedicated item_registry packet (handled below).
+    if (Array.isArray(pkt.itemstates)) {
+      world.registerItemStates(pkt.itemstates);
+      log.info(`item palette from start_game: ${world.itemNames.size} names`);
+    }
     log.info(`start_game: pos=${JSON.stringify(world.self.position)} entityId=${world.self.runtimeEntityId} gamemode=${world.self.gameMode} dim=${world.self.dimension}`);
 
     // CRITICAL post-spawn handshake (bedrock-protocol Discussion #566). Without
@@ -95,6 +102,14 @@ export function attachPerception(client: BedrockClient, world: World): void {
 
   client.on("play_status", (pkt: any) => {
     log.debug(`play_status: ${pkt.status}`);
+  });
+
+  // 1.21.60+: item palette arrives in its own packet before start_game.
+  client.on("item_registry", (pkt: any) => {
+    if (Array.isArray(pkt.itemstates)) {
+      world.registerItemStates(pkt.itemstates);
+      log.info(`item palette from item_registry: ${world.itemNames.size} names`);
+    }
   });
 
   // The first move_player after spawn carries our authoritative spawn position.
@@ -379,7 +394,8 @@ export function attachPerception(client: BedrockClient, world: World): void {
       world.inventory.set(i, {
         networkId: it.network_id,
         count: it.count,
-        name: it.name,
+        // Wire items carry no name — resolve through the item palette.
+        name: it.name ?? world.itemName(it.network_id),
         nbt: it.extra?.nbt,
       });
     }
@@ -395,7 +411,7 @@ export function attachPerception(client: BedrockClient, world: World): void {
       world.inventory.set(slot, {
         networkId: it.network_id,
         count: it.count,
-        name: it.name,
+        name: it.name ?? world.itemName(it.network_id),
         nbt: it.extra?.nbt,
       });
     }
