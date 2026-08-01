@@ -1,5 +1,7 @@
 # minecraft-bedrock-ai
 
+this kinda works lmao. minecraft is a hard game 
+
 A bot that plays Minecraft Bedrock Edition. It logs in over the regular client protocol, reads the world from packets, and learns to play by training a DQN on its own rollouts. A symbolic GOAP planner and an optional LLM goal-picker are also in the repo, used as teachers and for bootstrapping.
 
 The goal was to see how far you can get without doing pixel-based RL. Turns out: pretty far.
